@@ -33,6 +33,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from collections import deque
+from pathlib import Path
+
+OUTPUT_DIR = Path(__file__).parent
 
 np.random.seed(7)
 
@@ -94,20 +97,28 @@ def stdp_step(W: np.ndarray, sp_in: np.ndarray):
 
     for t in range(T_STEPS):
         V = TAU_M * V + sp_in[t] @ W
-        fired = V >= V_TH; V[fired] = 0.0; sp_out[t, fired] = 1.0
-        pre = sp_in[t].astype(bool); post = sp_out[t].astype(bool)
+        fired = V >= V_TH
+        V[fired] = 0.0
+        sp_out[t, fired] = 1.0
+        pre  = sp_in[t].astype(bool)
+        post = sp_out[t].astype(bool)
 
-        if pre.any() and t_post.max() > -999:
-            dt  = t - t_post
-            ltp = A_PLUS * np.exp(-dt / TAU_STDP); ltp[dt < 0] = 0
-            dw[np.ix_(pre, np.ones(N_HID, bool))] += ltp[np.newaxis, :]
+        # LTP: post_j just fired — strengthen (pre_i → post_j) where pre fired
+        # before post (dt > 0 means pre fired in the past)
+        if post.any():
+            dt  = t - t_pre                               # (N_IN,)
+            ltp = np.where(dt > 0, A_PLUS * np.exp(-dt / TAU_STDP), 0.0)
+            dw[:, post] += ltp[:, np.newaxis]
 
-        if post.any() and t_pre.max() > -999:
-            dt  = t - t_pre
-            ltd = A_MINUS * np.exp(-dt / TAU_STDP); ltd[dt < 0] = 0
-            dw[np.ix_(np.ones(N_IN, bool), post)] += ltd[:, np.newaxis]
+        # LTD: pre_i just fired — weaken (pre_i → post_j) where post fired
+        # before pre (dt > 0 means post fired in the past)
+        if pre.any():
+            dt  = t - t_post                              # (N_HID,)
+            ltd = np.where(dt > 0, A_MINUS * np.exp(-dt / TAU_STDP), 0.0)
+            dw[pre, :] += ltd[np.newaxis, :]
 
-        t_pre[pre] = t; t_post[post] = t
+        t_pre[pre]   = t
+        t_post[post] = t
 
     return sp_out, dw, sp_out.mean()
 
@@ -185,171 +196,170 @@ def evaluate(W: np.ndarray, patterns_seen: list, n_test: int = N_TEST):
     return accs
 
 
-# ---------------------------------------------------------------------------
-# Main experiment: compare naive SNN vs SNN with sleep
-# ---------------------------------------------------------------------------
-print("=" * 60)
-print("  Memory Consolidation – Sleep-based Replay")
-print("=" * 60)
+if __name__ == '__main__':
+    print("=" * 60)
+    print("  Memory Consolidation – Sleep-based Replay")
+    print("=" * 60)
 
-results = {}
+    results = {}
 
-for use_sleep in [False, True]:
-    label    = "With Sleep" if use_sleep else "No Sleep"
-    W        = np.random.uniform(0.05, 0.25, (N_IN, N_HID)).astype(np.float32)
-    buffer   = deque(maxlen=REPLAY_BUFFER_SIZE)
-    history  = []   # [(trial, pattern_block, accs_on_all_seen)]
-    trial_global = 0
+    for use_sleep in [False, True]:
+        label    = "With Sleep" if use_sleep else "No Sleep"
+        W        = np.random.uniform(0.05, 0.25, (N_IN, N_HID)).astype(np.float32)
+        buffer   = deque(maxlen=REPLAY_BUFFER_SIZE)
+        history  = []   # [(trial, pattern_block, accs_on_all_seen)]
+        trial_global = 0
 
-    print(f"\n[{label}]")
+        print(f"\n[{label}]")
+        for pid in range(N_PATTERNS):
+            print(f"  Learning pattern {pid}...")
+            for t in range(N_TRIALS_PER):
+                sp_in = make_pattern(pid)
+                _, dw, _ = stdp_step(W, sp_in)
+                W = np.clip(W + dw * 0.2, W_MIN, W_MAX)
+                buffer.append(sp_in)
+                trial_global += 1
+
+                # Sleep every N trials
+                if use_sleep and trial_global % SLEEP_EVERY == 0:
+                    W = sleep_consolidation(W, buffer, prune=True)
+
+                # Evaluate periodically
+                if t % 50 == 49:
+                    accs = evaluate(W, list(range(pid + 1)))
+                    history.append((trial_global, pid, accs))
+
+            accs_final = evaluate(W, list(range(pid + 1)))
+            print(f"    After pattern {pid}: " +
+                  " | ".join(f"P{p}={a*100:.0f}%" for p, a in enumerate(accs_final)))
+
+        results[label] = history
+
+    # ---------------------------------------------------------------------------
+    # Visualisation
+    # ---------------------------------------------------------------------------
+    fig = plt.figure(figsize=(16, 12))
+    gs  = gridspec.GridSpec(2, 3, hspace=0.4, wspace=0.35)
+
+    colors_pat = ['#4e79a7', '#f28e2b', '#e15759']
+
+    # Accuracy over time for each pattern — No Sleep
+    ax = fig.add_subplot(gs[0, 0])
+    hist = results["No Sleep"]
     for pid in range(N_PATTERNS):
-        print(f"  Learning pattern {pid}...")
-        for t in range(N_TRIALS_PER):
-            sp_in = make_pattern(pid)
-            _, dw, _ = stdp_step(W, sp_in)
-            W = np.clip(W + dw * 0.2, W_MIN, W_MAX)
-            buffer.append(sp_in)
-            trial_global += 1
+        xs, ys = [], []
+        for (trial, block, accs) in hist:
+            if pid < len(accs):
+                xs.append(trial); ys.append(accs[pid] * 100)
+        if xs:
+            ax.plot(xs, ys, color=colors_pat[pid], lw=1.5, label=f'Pattern {pid}')
+    # Shade learning blocks
+    for pid in range(N_PATTERNS):
+        ax.axvspan(pid*N_TRIALS_PER, (pid+1)*N_TRIALS_PER,
+                   alpha=0.06, color=colors_pat[pid])
+    ax.set_xlabel('Trial'); ax.set_ylabel('Accuracy (%)')
+    ax.set_title('No Sleep – Catastrophic Forgetting')
+    ax.legend(fontsize=9); ax.set_ylim(0, 105)
+    ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-            # Sleep every N trials
-            if use_sleep and trial_global % SLEEP_EVERY == 0:
-                W = sleep_consolidation(W, buffer, prune=True)
+    # Accuracy over time — With Sleep
+    ax = fig.add_subplot(gs[0, 1])
+    hist = results["With Sleep"]
+    for pid in range(N_PATTERNS):
+        xs, ys = [], []
+        for (trial, block, accs) in hist:
+            if pid < len(accs):
+                xs.append(trial); ys.append(accs[pid] * 100)
+        if xs:
+            ax.plot(xs, ys, color=colors_pat[pid], lw=1.5, label=f'Pattern {pid}')
+    for pid in range(N_PATTERNS):
+        ax.axvspan(pid*N_TRIALS_PER, (pid+1)*N_TRIALS_PER,
+                   alpha=0.06, color=colors_pat[pid])
+    # Mark sleep events
+    sleep_trials = list(range(SLEEP_EVERY, N_PATTERNS*N_TRIALS_PER, SLEEP_EVERY))
+    for st in sleep_trials:
+        ax.axvline(st, color='navy', alpha=0.15, lw=0.8)
+    ax.set_xlabel('Trial'); ax.set_ylabel('Accuracy (%)')
+    ax.set_title('With Sleep – Memory Preserved')
+    ax.legend(fontsize=9); ax.set_ylim(0, 105)
+    ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-            # Evaluate periodically
-            if t % 50 == 49:
-                accs = evaluate(W, list(range(pid + 1)))
-                history.append((trial_global, pid, accs))
+    # Final accuracy comparison
+    ax = fig.add_subplot(gs[0, 2])
+    W_no_sleep    = np.random.uniform(0.05, 0.25, (N_IN, N_HID)).astype(np.float32)
+    W_with_sleep  = np.random.uniform(0.05, 0.25, (N_IN, N_HID)).astype(np.float32)
+    buf2 = deque(maxlen=REPLAY_BUFFER_SIZE)
 
-        accs_final = evaluate(W, list(range(pid + 1)))
-        print(f"    After pattern {pid}: " +
-              " | ".join(f"P{p}={a*100:.0f}%" for p, a in enumerate(accs_final)))
+    for pid in range(N_PATTERNS):
+        for _ in range(N_TRIALS_PER):
+            sp  = make_pattern(pid)
+            _, dw, _ = stdp_step(W_no_sleep, sp); W_no_sleep = np.clip(W_no_sleep + dw*0.5, 0, 1)
+            _, dw, _ = stdp_step(W_with_sleep, sp); W_with_sleep = np.clip(W_with_sleep + dw*0.5, 0, 1)
+            buf2.append(sp)
+        if pid < N_PATTERNS - 1:
+            W_with_sleep = sleep_consolidation(W_with_sleep, buf2)
 
-    results[label] = history
+    acc_no   = evaluate(W_no_sleep,   list(range(N_PATTERNS)))
+    acc_with = evaluate(W_with_sleep, list(range(N_PATTERNS)))
 
-# ---------------------------------------------------------------------------
-# Visualisation
-# ---------------------------------------------------------------------------
-fig = plt.figure(figsize=(16, 12))
-gs  = gridspec.GridSpec(2, 3, hspace=0.4, wspace=0.35)
+    x      = np.arange(N_PATTERNS)
+    width  = 0.35
+    bars1  = ax.bar(x - width/2, [a*100 for a in acc_no],
+                    width, color='#e15759', alpha=0.85, label='No Sleep')
+    bars2  = ax.bar(x + width/2, [a*100 for a in acc_with],
+                    width, color='#59a14f', alpha=0.85, label='With Sleep')
+    ax.set_xticks(x); ax.set_xticklabels([f'Pattern {p}' for p in range(N_PATTERNS)])
+    ax.set_ylabel('Final Accuracy (%)')
+    ax.set_title('Final Accuracy on All Patterns')
+    ax.legend(); ax.set_ylim(0, 115)
+    ax.grid(True, alpha=0.3, axis='y'); ax.set_facecolor('#fafafa')
 
-colors_pat = ['#4e79a7', '#f28e2b', '#e15759']
+    # Spike pattern visualisation
+    ax = fig.add_subplot(gs[1, 0])
+    for pid in range(N_PATTERNS):
+        sp = make_pattern(pid)
+        offset = pid * (N_IN + 5)
+        for nid in range(N_IN):
+            ts = np.where(sp[:, nid])[0]
+            if len(ts):
+                ax.scatter(ts, [nid + offset]*len(ts),
+                           s=3, c=colors_pat[pid], marker='|')
+    ax.set_xlabel('Timestep'); ax.set_ylabel('Neuron (stacked)')
+    ax.set_title('The 3 Patterns to Learn\n(colour = pattern ID)')
+    ax.set_facecolor('#fafafa')
 
-# Accuracy over time for each pattern — No Sleep
-ax = fig.add_subplot(gs[0, 0])
-hist = results["No Sleep"]
-for pid in range(N_PATTERNS):
-    xs, ys = [], []
-    for (trial, block, accs) in hist:
-        if pid < len(accs):
-            xs.append(trial); ys.append(accs[pid] * 100)
-    if xs:
-        ax.plot(xs, ys, color=colors_pat[pid], lw=1.5, label=f'Pattern {pid}')
-# Shade learning blocks
-for pid in range(N_PATTERNS):
-    ax.axvspan(pid*N_TRIALS_PER, (pid+1)*N_TRIALS_PER,
-               alpha=0.06, color=colors_pat[pid])
-ax.set_xlabel('Trial'); ax.set_ylabel('Accuracy (%)')
-ax.set_title('No Sleep – Catastrophic Forgetting')
-ax.legend(fontsize=9); ax.set_ylim(0, 105)
-ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
+    # Synaptic weight distribution: before/after sleep
+    ax = fig.add_subplot(gs[1, 1])
+    W_before = np.random.uniform(0.05, 0.4, (N_IN, N_HID)).astype(np.float32)
+    W_after  = sleep_consolidation(W_before.copy(),
+                                    deque([make_pattern(p) for p in range(N_PATTERNS)] * 20,
+                                          maxlen=REPLAY_BUFFER_SIZE))
+    ax.hist(W_before.flatten(), bins=40, alpha=0.6, color='#e15759',
+            label='Before sleep', density=True)
+    ax.hist(W_after.flatten(),  bins=40, alpha=0.6, color='#59a14f',
+            label='After sleep',  density=True)
+    ax.set_xlabel('Weight value'); ax.set_ylabel('Density')
+    ax.set_title('Weight Distribution Before/After Sleep\n(weak synapses pruned)')
+    ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-# Accuracy over time — With Sleep
-ax = fig.add_subplot(gs[0, 1])
-hist = results["With Sleep"]
-for pid in range(N_PATTERNS):
-    xs, ys = [], []
-    for (trial, block, accs) in hist:
-        if pid < len(accs):
-            xs.append(trial); ys.append(accs[pid] * 100)
-    if xs:
-        ax.plot(xs, ys, color=colors_pat[pid], lw=1.5, label=f'Pattern {pid}')
-for pid in range(N_PATTERNS):
-    ax.axvspan(pid*N_TRIALS_PER, (pid+1)*N_TRIALS_PER,
-               alpha=0.06, color=colors_pat[pid])
-# Mark sleep events
-sleep_trials = list(range(SLEEP_EVERY, N_PATTERNS*N_TRIALS_PER, SLEEP_EVERY))
-for st in sleep_trials:
-    ax.axvline(st, color='navy', alpha=0.15, lw=0.8)
-ax.set_xlabel('Trial'); ax.set_ylabel('Accuracy (%)')
-ax.set_title('With Sleep – Memory Preserved')
-ax.legend(fontsize=9); ax.set_ylim(0, 105)
-ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
+    # Summary: forgetting rates
+    ax = fig.add_subplot(gs[1, 2])
+    forget_no   = [max(0, 0.9 - acc_no[p])   for p in range(N_PATTERNS-1)]
+    forget_with = [max(0, 0.9 - acc_with[p]) for p in range(N_PATTERNS-1)]
+    x2     = np.arange(N_PATTERNS - 1)
+    ax.bar(x2 - 0.2, [f*100 for f in forget_no],   0.35,
+           color='#e15759', alpha=0.85, label='No Sleep')
+    ax.bar(x2 + 0.2, [f*100 for f in forget_with], 0.35,
+           color='#59a14f', alpha=0.85, label='With Sleep')
+    ax.set_xticks(x2)
+    ax.set_xticklabels([f'Pattern {p}' for p in range(N_PATTERNS-1)])
+    ax.set_ylabel('Forgetting (%)')
+    ax.set_title('Catastrophic Forgetting Reduction')
+    ax.legend(); ax.grid(True, alpha=0.3, axis='y'); ax.set_facecolor('#fafafa')
 
-# Final accuracy comparison
-ax = fig.add_subplot(gs[0, 2])
-W_no_sleep    = np.random.uniform(0.05, 0.25, (N_IN, N_HID)).astype(np.float32)
-W_with_sleep  = np.random.uniform(0.05, 0.25, (N_IN, N_HID)).astype(np.float32)
-buf2 = deque(maxlen=REPLAY_BUFFER_SIZE)
+    fig.suptitle('Memory Consolidation – Sleep-based Replay Prevents Catastrophic Forgetting',
+                 fontsize=13, fontweight='bold')
+    plt.savefig(OUTPUT_DIR / 'memory_consolidation.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("\nPlot saved → Learning/memory_consolidation.png")
 
-for pid in range(N_PATTERNS):
-    for _ in range(N_TRIALS_PER):
-        sp  = make_pattern(pid)
-        _, dw, _ = stdp_step(W_no_sleep, sp); W_no_sleep = np.clip(W_no_sleep + dw*0.5, 0, 1)
-        _, dw, _ = stdp_step(W_with_sleep, sp); W_with_sleep = np.clip(W_with_sleep + dw*0.5, 0, 1)
-        buf2.append(sp)
-    if pid < N_PATTERNS - 1:
-        W_with_sleep = sleep_consolidation(W_with_sleep, buf2)
-
-acc_no   = evaluate(W_no_sleep,   list(range(N_PATTERNS)))
-acc_with = evaluate(W_with_sleep, list(range(N_PATTERNS)))
-
-x      = np.arange(N_PATTERNS)
-width  = 0.35
-bars1  = ax.bar(x - width/2, [a*100 for a in acc_no],
-                width, color='#e15759', alpha=0.85, label='No Sleep')
-bars2  = ax.bar(x + width/2, [a*100 for a in acc_with],
-                width, color='#59a14f', alpha=0.85, label='With Sleep')
-ax.set_xticks(x); ax.set_xticklabels([f'Pattern {p}' for p in range(N_PATTERNS)])
-ax.set_ylabel('Final Accuracy (%)')
-ax.set_title('Final Accuracy on All Patterns')
-ax.legend(); ax.set_ylim(0, 115)
-ax.grid(True, alpha=0.3, axis='y'); ax.set_facecolor('#fafafa')
-
-# Spike pattern visualisation
-ax = fig.add_subplot(gs[1, 0])
-for pid in range(N_PATTERNS):
-    sp = make_pattern(pid)
-    offset = pid * (N_IN + 5)
-    for nid in range(N_IN):
-        ts = np.where(sp[:, nid])[0]
-        if len(ts):
-            ax.scatter(ts, [nid + offset]*len(ts),
-                       s=3, c=colors_pat[pid], marker='|')
-ax.set_xlabel('Timestep'); ax.set_ylabel('Neuron (stacked)')
-ax.set_title('The 3 Patterns to Learn\n(colour = pattern ID)')
-ax.set_facecolor('#fafafa')
-
-# Synaptic weight distribution: before/after sleep
-ax = fig.add_subplot(gs[1, 1])
-W_before = np.random.uniform(0.05, 0.4, (N_IN, N_HID)).astype(np.float32)
-W_after  = sleep_consolidation(W_before.copy(),
-                                deque([make_pattern(p) for p in range(N_PATTERNS)] * 20,
-                                      maxlen=REPLAY_BUFFER_SIZE))
-ax.hist(W_before.flatten(), bins=40, alpha=0.6, color='#e15759',
-        label='Before sleep', density=True)
-ax.hist(W_after.flatten(),  bins=40, alpha=0.6, color='#59a14f',
-        label='After sleep',  density=True)
-ax.set_xlabel('Weight value'); ax.set_ylabel('Density')
-ax.set_title('Weight Distribution Before/After Sleep\n(weak synapses pruned)')
-ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
-
-# Summary: forgetting rates
-ax = fig.add_subplot(gs[1, 2])
-forget_no   = [max(0, 0.9 - acc_no[p])   for p in range(N_PATTERNS-1)]
-forget_with = [max(0, 0.9 - acc_with[p]) for p in range(N_PATTERNS-1)]
-x2     = np.arange(N_PATTERNS - 1)
-ax.bar(x2 - 0.2, [f*100 for f in forget_no],   0.35,
-       color='#e15759', alpha=0.85, label='No Sleep')
-ax.bar(x2 + 0.2, [f*100 for f in forget_with], 0.35,
-       color='#59a14f', alpha=0.85, label='With Sleep')
-ax.set_xticks(x2)
-ax.set_xticklabels([f'Pattern {p}' for p in range(N_PATTERNS-1)])
-ax.set_ylabel('Forgetting (%)')
-ax.set_title('Catastrophic Forgetting Reduction')
-ax.legend(); ax.grid(True, alpha=0.3, axis='y'); ax.set_facecolor('#fafafa')
-
-fig.suptitle('Memory Consolidation – Sleep-based Replay Prevents Catastrophic Forgetting',
-             fontsize=13, fontweight='bold')
-plt.savefig('Learning/memory_consolidation.png', dpi=150, bbox_inches='tight')
-plt.close()
-print("\nPlot saved → Learning/memory_consolidation.png")

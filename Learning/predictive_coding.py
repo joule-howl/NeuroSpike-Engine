@@ -42,6 +42,9 @@ Reference:
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from pathlib import Path
+
+OUTPUT_DIR = Path(__file__).parent
 
 np.random.seed(0)
 
@@ -142,8 +145,8 @@ class PredictiveCodingNetwork:
         x = x.astype(np.float32)
 
         # Initialise layer representations with bottom-up pass
-        self.layers[0].r = self._relu_init(x @ self.layers[0].W_up)
-        self.layers[1].r = self._relu_init(
+        self.layers[0].r = PCLayer._relu_init(x @ self.layers[0].W_up)
+        self.layers[1].r = PCLayer._relu_init(
             self.layers[0].r @ self.layers[1].W_up)
 
         errors_history = []
@@ -234,148 +237,141 @@ def make_digit_data(n_samples: int = N_TRAIN):
     return np.array(X), np.array(Y)
 
 
-print("=" * 55)
-print("  Predictive Coding Network")
-print("=" * 55)
+if __name__ == '__main__':
+    print("=" * 55)
+    print("  Predictive Coding Network")
+    print("=" * 55)
 
-# Try to load real MNIST, fall back to synthetic
-try:
-    from torchvision import datasets, transforms
-    mnist = datasets.MNIST(root='./data', train=True,
-                           download=True, transform=transforms.ToTensor())
-    X_all = mnist.data.numpy().reshape(-1, 784).astype(np.float32) / 255.0
-    Y_all = mnist.targets.numpy()
-    X_train, Y_train = X_all[:N_TRAIN], Y_all[:N_TRAIN]
-    X_test,  Y_test  = X_all[N_TRAIN:N_TRAIN+200], Y_all[N_TRAIN:N_TRAIN+200]
-    print("  Using real MNIST data")
-except Exception:
-    X_train, Y_train = make_digit_data(N_TRAIN)
-    X_test,  Y_test  = make_digit_data(200)
-    print("  Using synthetic digit data")
+    # Try to load real MNIST, fall back to synthetic
+    try:
+        from torchvision import datasets, transforms
+        mnist = datasets.MNIST(root='./data', train=True,
+                               download=True, transform=transforms.ToTensor())
+        X_all = mnist.data.numpy().reshape(-1, 784).astype(np.float32) / 255.0
+        Y_all = mnist.targets.numpy()
+        X_train, Y_train = X_all[:N_TRAIN], Y_all[:N_TRAIN]
+        X_test,  Y_test  = X_all[N_TRAIN:N_TRAIN+200], Y_all[N_TRAIN:N_TRAIN+200]
+        print("  Using real MNIST data")
+    except Exception:
+        X_train, Y_train = make_digit_data(N_TRAIN)
+        X_test,  Y_test  = make_digit_data(200)
+        print("  Using synthetic digit data")
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-net = PredictiveCodingNetwork()
-acc_per_epoch = []
-error_L1_log, error_L2_log = [], []
-pred_error_ratio = []   # ratio of error transmitted vs full signal
+    # ---------------------------------------------------------------------------
+    # Training loop
+    # ---------------------------------------------------------------------------
+    net = PredictiveCodingNetwork()
+    acc_per_epoch = []
+    error_L1_log, error_L2_log = [], []
+    pred_error_ratio = []   # ratio of error transmitted vs full signal
 
-for epoch in range(N_EPOCHS):
-    correct   = 0
-    e1_epoch, e2_epoch = [], []
-    err_norm_epoch, sig_norm_epoch = [], []
-    idx = np.random.permutation(N_TRAIN)
+    for epoch in range(N_EPOCHS):
+        correct   = 0
+        e1_epoch, e2_epoch = [], []
+        err_norm_epoch, sig_norm_epoch = [], []
+        idx = np.random.permutation(N_TRAIN)
 
-    for i in idx:
-        pred, (e1, e2) = net.learn(X_train[i], int(Y_train[i]))
-        correct += int(pred == Y_train[i])
-        e1_epoch.append(e1); e2_epoch.append(e2)
-        # Sparsity: how much of the signal is "error" vs total
-        err_norm = np.sqrt(e1)
-        sig_norm = np.linalg.norm(X_train[i]) / np.sqrt(N_INPUT)
-        err_norm_epoch.append(err_norm / (sig_norm + 1e-6))
+        for i in idx:
+            pred, (e1, e2) = net.learn(X_train[i], int(Y_train[i]))
+            correct += int(pred == Y_train[i])
+            e1_epoch.append(e1); e2_epoch.append(e2)
+            err_norm = np.sqrt(e1)
+            sig_norm = np.linalg.norm(X_train[i]) / np.sqrt(N_INPUT)
+            err_norm_epoch.append(err_norm / (sig_norm + 1e-6))
 
-    acc  = correct / N_TRAIN
-    acc_per_epoch.append(acc)
-    error_L1_log.append(np.mean(e1_epoch))
-    error_L2_log.append(np.mean(e2_epoch))
-    pred_error_ratio.append(np.mean(err_norm_epoch))
-    print(f"  Epoch {epoch+1:2d}/{N_EPOCHS} | "
-          f"Acc = {acc*100:.1f}% | "
-          f"L1 error = {error_L1_log[-1]:.4f} | "
-          f"Error ratio = {pred_error_ratio[-1]*100:.1f}%")
+        acc  = correct / N_TRAIN
+        acc_per_epoch.append(acc)
+        error_L1_log.append(np.mean(e1_epoch))
+        error_L2_log.append(np.mean(e2_epoch))
+        pred_error_ratio.append(np.mean(err_norm_epoch))
+        print(f"  Epoch {epoch+1:2d}/{N_EPOCHS} | "
+              f"Acc = {acc*100:.1f}% | "
+              f"L1 error = {error_L1_log[-1]:.4f} | "
+              f"Error ratio = {pred_error_ratio[-1]*100:.1f}%")
 
-# Test accuracy
-test_correct = sum(
-    net.infer(X_test[i], None)[1] == int(Y_test[i])
-    for i in range(len(Y_test))
-)
-test_acc = test_correct / len(Y_test)
-print(f"\nTest accuracy : {test_acc*100:.1f}%")
-print(f"Mean prediction error ratio: {np.mean(pred_error_ratio)*100:.1f}% "
-      f"of signal transmitted as error (sparse!)")
+    # Test accuracy
+    test_correct = sum(
+        net.infer(X_test[i], None)[1] == int(Y_test[i])
+        for i in range(len(Y_test))
+    )
+    test_acc = test_correct / len(Y_test)
+    print(f"\nTest accuracy : {test_acc*100:.1f}%")
+    print(f"Mean prediction error ratio: {np.mean(pred_error_ratio)*100:.1f}% "
+          f"of signal transmitted as error (sparse!)")
 
+    # ---------------------------------------------------------------------------
+    # Visualisation
+    # ---------------------------------------------------------------------------
+    fig = plt.figure(figsize=(16, 10))
+    gs  = gridspec.GridSpec(2, 3, hspace=0.4, wspace=0.35)
 
-# ---------------------------------------------------------------------------
-# Visualisation
-# ---------------------------------------------------------------------------
-fig = plt.figure(figsize=(16, 10))
-gs  = gridspec.GridSpec(2, 3, hspace=0.4, wspace=0.35)
+    ax = fig.add_subplot(gs[0, 0])
+    ax.plot(range(1, N_EPOCHS+1), [a*100 for a in acc_per_epoch],
+            'o-', color='#e15759', lw=2)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Accuracy (%)')
+    ax.set_title('Training Accuracy')
+    ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-# Accuracy
-ax = fig.add_subplot(gs[0, 0])
-ax.plot(range(1, N_EPOCHS+1), [a*100 for a in acc_per_epoch],
-        'o-', color='#e15759', lw=2)
-ax.set_xlabel('Epoch'); ax.set_ylabel('Accuracy (%)')
-ax.set_title('Training Accuracy')
-ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
+    ax = fig.add_subplot(gs[0, 1])
+    ax.plot(range(1, N_EPOCHS+1), error_L1_log,
+            'o-', color='#4e79a7', lw=2, label='Layer 1 MSE')
+    ax.plot(range(1, N_EPOCHS+1), error_L2_log,
+            's--', color='#f28e2b', lw=2, label='Layer 2 MSE')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Prediction Error (MSE)')
+    ax.set_title('Prediction Errors Decrease')
+    ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-# Prediction errors converging
-ax = fig.add_subplot(gs[0, 1])
-ax.plot(range(1, N_EPOCHS+1), error_L1_log,
-        'o-', color='#4e79a7', lw=2, label='Layer 1 MSE')
-ax.plot(range(1, N_EPOCHS+1), error_L2_log,
-        's--', color='#f28e2b', lw=2, label='Layer 2 MSE')
-ax.set_xlabel('Epoch'); ax.set_ylabel('Prediction Error (MSE)')
-ax.set_title('Prediction Errors Decrease')
-ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
+    ax = fig.add_subplot(gs[0, 2])
+    ax.plot(range(1, N_EPOCHS+1), [r*100 for r in pred_error_ratio],
+            'o-', color='#59a14f', lw=2)
+    ax.fill_between(range(1, N_EPOCHS+1), [r*100 for r in pred_error_ratio],
+                    alpha=0.15, color='#59a14f')
+    ax.axhline(100, color='red', linestyle='--', lw=1, alpha=0.5,
+               label='Full signal (no prediction)')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Error / Signal (%)')
+    ax.set_title('Transmission Efficiency\n(lower = more predictable = more efficient)')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-# Sparsity of transmitted signal
-ax = fig.add_subplot(gs[0, 2])
-ax.plot(range(1, N_EPOCHS+1), [r*100 for r in pred_error_ratio],
-        'o-', color='#59a14f', lw=2)
-ax.fill_between(range(1, N_EPOCHS+1), [r*100 for r in pred_error_ratio],
-                alpha=0.15, color='#59a14f')
-ax.axhline(100, color='red', linestyle='--', lw=1, alpha=0.5,
-           label='Full signal (no prediction)')
-ax.set_xlabel('Epoch'); ax.set_ylabel('Error / Signal (%)')
-ax.set_title('Transmission Efficiency\n(lower = more predictable = more efficient)')
-ax.legend(fontsize=8); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
+    ax = fig.add_subplot(gs[1, 0])
+    sample_x = X_test[0]; sample_y = int(Y_test[0])
+    err_history, _, _ = net.infer(sample_x, sample_y)
+    l1_trace = [e[0] for e in err_history]
+    l2_trace = [e[1] for e in err_history]
+    ax.plot(l1_trace, color='#4e79a7', lw=2, label='Layer 1 error')
+    ax.plot(l2_trace, color='#f28e2b', lw=2, label='Layer 2 error')
+    ax.set_xlabel('Inference step'); ax.set_ylabel('Prediction error')
+    ax.set_title(f'Error Relaxation During Inference\n(label={sample_y})')
+    ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-# Inference relaxation for one sample
-ax = fig.add_subplot(gs[1, 0])
-sample_x = X_test[0]; sample_y = int(Y_test[0])
-err_history, _, _ = net.infer(sample_x, sample_y)
-l1_trace = [e[0] for e in err_history]
-l2_trace = [e[1] for e in err_history]
-ax.plot(l1_trace, color='#4e79a7', lw=2, label='Layer 1 error')
-ax.plot(l2_trace, color='#f28e2b', lw=2, label='Layer 2 error')
-ax.set_xlabel('Inference step'); ax.set_ylabel('Prediction error')
-ax.set_title(f'Error Relaxation During Inference\n(label={sample_y})')
-ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
+    ax = fig.add_subplot(gs[1, 1])
+    n_show = min(16, N_HIDDEN)
+    grid   = np.zeros((4 * 28, 4 * 28))
+    for i in range(n_show):
+        r, c = divmod(i, 4)
+        patch = net.layers[0].W_down[i].reshape(28, 28)
+        patch = (patch - patch.min()) / (patch.max() - patch.min() + 1e-6)
+        grid[r*28:(r+1)*28, c*28:(c+1)*28] = patch
+    ax.imshow(grid, cmap='RdBu_r', interpolation='nearest')
+    ax.set_title('Generative Weights L1\n(learned "what to predict")')
+    ax.axis('off')
 
-# Generative weights visualisation (L1 predicts input)
-ax = fig.add_subplot(gs[1, 1])
-# Show first 16 rows of W_down as 28×28 patches
-n_show = min(16, N_HIDDEN)
-grid   = np.zeros((4 * 28, 4 * 28))
-for i in range(n_show):
-    r, c = divmod(i, 4)
-    patch = net.layers[0].W_down[i].reshape(28, 28)
-    patch = (patch - patch.min()) / (patch.max() - patch.min() + 1e-6)
-    grid[r*28:(r+1)*28, c*28:(c+1)*28] = patch
-ax.imshow(grid, cmap='RdBu_r', interpolation='nearest')
-ax.set_title('Generative Weights L1\n(learned "what to predict")')
-ax.axis('off')
+    ax = fig.add_subplot(gs[1, 2])
+    final_ratio = pred_error_ratio[-1]
+    categories  = ['Full signal\n(naive)', 'Prediction error\n(PC network)']
+    sizes       = [100, final_ratio * 100]
+    ax.bar(categories, sizes,
+           color=['#e15759', '#59a14f'], alpha=0.85, edgecolor='white')
+    for i, val in enumerate(sizes):
+        ax.text(i, val + 1, f'{val:.1f}%', ha='center',
+                fontsize=11, fontweight='bold')
+    ax.set_ylabel('Fraction of signal transmitted (%)')
+    ax.set_title('Communication Efficiency\n(brain transmits only errors)')
+    ax.set_ylim(0, 120)
+    ax.grid(True, alpha=0.3, axis='y'); ax.set_facecolor('#fafafa')
 
-# Comparison: full signal vs error signal size
-ax = fig.add_subplot(gs[1, 2])
-final_ratio = pred_error_ratio[-1]
-categories  = ['Full signal\n(naive)', 'Prediction error\n(PC network)']
-sizes       = [100, final_ratio * 100]
-ax.bar(categories, sizes,
-       color=['#e15759', '#59a14f'], alpha=0.85, edgecolor='white')
-for i, val in enumerate(sizes):
-    ax.text(i, val + 1, f'{val:.1f}%', ha='center',
-            fontsize=11, fontweight='bold')
-ax.set_ylabel('Fraction of signal transmitted (%)')
-ax.set_title('Communication Efficiency\n(brain transmits only errors)')
-ax.set_ylim(0, 120)
-ax.grid(True, alpha=0.3, axis='y'); ax.set_facecolor('#fafafa')
+    fig.suptitle('Predictive Coding – Biologically Plausible Generative Learning',
+                 fontsize=13, fontweight='bold')
+    plt.savefig(OUTPUT_DIR / 'predictive_coding.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("Plot saved → Learning/predictive_coding.png")
 
-fig.suptitle('Predictive Coding – Biologically Plausible Generative Learning',
-             fontsize=13, fontweight='bold')
-plt.savefig('Learning/predictive_coding.png', dpi=150, bbox_inches='tight')
-plt.close()
-print("Plot saved → Learning/predictive_coding.png")

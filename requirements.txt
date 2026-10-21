@@ -1,6 +1,6 @@
-numpy==2.2.1
-matplotlib==3.11.0
-scipy==1.18.0
-torch==2.12.1
-torchvision==0.27.1
-snntorch==1.0.0
+numpy>=1.24,<3.0
+matplotlib>=3.7
+scipy>=1.10
+torch>=2.0
+torchvision>=0.15
+snntorch>=0.9

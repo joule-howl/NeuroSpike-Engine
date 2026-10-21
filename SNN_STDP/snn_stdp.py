@@ -15,7 +15,11 @@ STDP rule:
 import numpy as np
 import matplotlib.pyplot as plt
 import warnings
+from pathlib import Path
+
 warnings.filterwarnings('ignore')
+
+OUTPUT_DIR = Path(__file__).parent
 
 # ---------------------------------------------------------------------------
 # Optional dependency check
@@ -99,6 +103,11 @@ def stdp_update(spike_in, spike_out, W,
     """
     Compute ΔW for a single sample from the input and output spike trains.
     Returns a delta matrix of the same shape as W.
+
+    Correct STDP rule: only update synapses (i→j) where neuron i (pre) and
+    neuron j (post) both participate — not all-to-all pairs.
+      LTP: when post_j fires, strengthen each (pre_i → post_j) that fired before
+      LTD: when pre_i fires, weaken each (pre_i → post_j) whose post fired before
     """
     T     = spike_in.shape[0]
     n_in  = W.shape[0]
@@ -109,22 +118,26 @@ def stdp_update(spike_in, spike_out, W,
     t_post = -999.0 * np.ones(n_out)
 
     for t in range(T):
-        pre  = spike_in[t].astype(bool)
-        post = spike_out[t].astype(bool)
+        pre  = spike_in[t].astype(bool)   # shape (n_in,)
+        post = spike_out[t].astype(bool)  # shape (n_out,)
 
-        # LTP: pre just fired → reward all post neurons that fired before
-        if pre.any() and t_post.max() > -999:
-            dt  = t - t_post
-            ltp = a_plus * np.exp(-dt / tau_plus)
-            ltp[dt < 0] = 0
-            dw[np.ix_(pre, np.ones(n_out, bool))] += ltp[np.newaxis, :]
+        # LTP: post_j just fired — for each (pre_i → post_j) pair,
+        # strengthen if pre_i fired recently (dt = t - t_pre[i] > 0)
+        if post.any():
+            dt = t - t_pre            # (n_in,)  time since each pre fired
+            valid = dt > 0            # only causal pairs (pre before post)
+            ltp = np.where(valid, a_plus * np.exp(-dt / tau_plus), 0.0)
+            # dw[i, j] += ltp[i] for each active post neuron j
+            dw[:, post] += ltp[:, np.newaxis]
 
-        # LTD: post just fired → penalise all pre neurons that fired before
-        if post.any() and t_pre.max() > -999:
-            dt  = t - t_pre
-            ltd = a_minus * np.exp(-dt / tau_minus)
-            ltd[dt < 0] = 0
-            dw[np.ix_(np.ones(n_in, bool), post)] += ltd[:, np.newaxis]
+        # LTD: pre_i just fired — for each (pre_i → post_j) pair,
+        # weaken if post_j fired recently (dt = t - t_post[j] > 0)
+        if pre.any():
+            dt = t - t_post           # (n_out,)  time since each post fired
+            valid = dt > 0            # only causal pairs (post before pre)
+            ltd = np.where(valid, a_minus * np.exp(-dt / tau_minus), 0.0)
+            # dw[i, j] += ltd[j] for each active pre neuron i
+            dw[pre, :] += ltd[np.newaxis, :]
 
         t_pre[pre]   = t
         t_post[post] = t
@@ -142,118 +155,119 @@ def get_sample(idx):
     return np.random.rand(N_INPUT) * 0.4, 0
 
 
-# ---------------------------------------------------------------------------
-# Encode and visualise the first sample
-# ---------------------------------------------------------------------------
-np.random.seed(0)
-rates0, label0 = get_sample(0)
-spike_train0   = poisson_encode(rates0, T_STEPS)
+if __name__ == '__main__':
+    # ---------------------------------------------------------------------------
+    # Encode and visualise the first sample
+    # ---------------------------------------------------------------------------
+    np.random.seed(0)
+    rates0, label0 = get_sample(0)
+    spike_train0   = poisson_encode(rates0, T_STEPS)
 
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6))
-ax1.imshow(rates0.reshape(28, 28), cmap='gray', interpolation='nearest')
-ax1.set_title(f'MNIST Image – label: {label0}', fontsize=11)
-ax1.axis('off')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6))
+    ax1.imshow(rates0.reshape(28, 28), cmap='gray', interpolation='nearest')
+    ax1.set_title(f'MNIST Image – label: {label0}', fontsize=11)
+    ax1.axis('off')
 
-for nid in range(100):
-    ts = np.where(spike_train0[:, nid])[0]
-    if len(ts):
-        ax2.scatter(ts, [nid] * len(ts), s=1.5, c='#333333', marker='|')
-ax2.set_xlabel('Timestep')
-ax2.set_ylabel('Input Neuron Index')
-ax2.set_title('Spike Train – Poisson Encoding (first 100 neurons)')
-ax2.set_xlim(0, T_STEPS)
-ax2.set_facecolor('#fafafa')
-plt.tight_layout()
-plt.savefig('SNN_STDP/spike_encoding.png', dpi=150, bbox_inches='tight')
-plt.close()
-
-# ---------------------------------------------------------------------------
-# STDP training loop
-# ---------------------------------------------------------------------------
-np.random.seed(1)
-W = np.random.uniform(0.0, 0.3, (N_INPUT, N_HIDDEN)).astype(np.float32)
-
-N_EPOCHS  = 20
-N_SAMPLES = 200
-dw_history = []
-
-for epoch in range(N_EPOCHS):
-    dw_total = np.zeros_like(W)
-    for s in range(N_SAMPLES):
-        rates, _ = get_sample(s)
-        sp_in    = poisson_encode(rates, T_STEPS)
-        sp_out   = lif_forward(sp_in, W)
-        dw_total += stdp_update(sp_in, sp_out, W)
-
-    W = np.clip(W + dw_total / N_SAMPLES, W_MIN, W_MAX)
-    dw_history.append(np.abs(dw_total).mean())
-
-    if (epoch + 1) % 5 == 0:
-        print(f"  Epoch {epoch+1:2d}/{N_EPOCHS} | ΔW = {dw_history[-1]:.6f} | W_mean = {W.mean():.4f}")
-
-# ---------------------------------------------------------------------------
-# Visualisation
-# ---------------------------------------------------------------------------
-W_init = np.random.uniform(0.0, 0.3, (N_INPUT, N_HIDDEN))
-
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-axes[0].plot(dw_history, color='#e15759', linewidth=2, marker='o', markersize=4)
-axes[0].set_xlabel('Epoch')
-axes[0].set_ylabel('Mean |ΔW|')
-axes[0].set_title('Weight Convergence over Epochs')
-axes[0].grid(True, alpha=0.3)
-axes[0].set_facecolor('#fafafa')
-
-axes[1].hist(W_init.flatten(), bins=50, alpha=0.6, color='#4e79a7',
-             label='Initialisation', density=True)
-axes[1].hist(W.flatten(), bins=50, alpha=0.6, color='#f28e2b',
-             label='After STDP', density=True)
-axes[1].set_xlabel('Weight Value')
-axes[1].set_ylabel('Probability Density')
-axes[1].set_title('Weight Distribution Before / After STDP')
-axes[1].legend()
-axes[1].grid(True, alpha=0.3)
-axes[1].set_facecolor('#fafafa')
-plt.tight_layout()
-plt.savefig('SNN_STDP/stdp_weights.png', dpi=150, bbox_inches='tight')
-plt.close()
-
-# Receptive fields of hidden layer neurons
-fig, axes = plt.subplots(4, 4, figsize=(10, 10))
-fig.suptitle('Receptive Fields – 16 Hidden Neurons (post-STDP)', fontsize=12, fontweight='bold')
-for i, ax in enumerate(axes.flatten()):
-    im = ax.imshow(W[:, i].reshape(28, 28), cmap='RdBu_r',
-                   vmin=W_MIN, vmax=W_MAX, interpolation='nearest')
-    ax.axis('off')
-    ax.set_title(f'H{i}', fontsize=7)
-plt.colorbar(im, ax=axes.flatten()[-1], fraction=0.046, pad=0.04)
-plt.tight_layout()
-plt.savefig('SNN_STDP/receptive_fields.png', dpi=150, bbox_inches='tight')
-plt.close()
-
-# Raster plot before / after STDP
-fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharey=True)
-fig.suptitle('Hidden Layer Activity – Before and After STDP', fontsize=12)
-for ax, W_plot, title, col in [
-    (axes[0], W_init.astype(np.float32), 'Before STDP', '#4e79a7'),
-    (axes[1], W,                          'After STDP',  '#e15759'),
-]:
-    sp = lif_forward(spike_train0, W_plot)
-    for nid in range(N_HIDDEN):
-        ts = np.where(sp[:, nid])[0]
+    for nid in range(100):
+        ts = np.where(spike_train0[:, nid])[0]
         if len(ts):
-            ax.scatter(ts, [nid] * len(ts), s=2.5, c=col, marker='|')
-    ax.set_ylabel('Hidden Neuron')
-    ax.set_title(f'{title} | Total spikes = {sp.sum():.0f}')
-    ax.set_facecolor('#fafafa')
-axes[-1].set_xlabel('Timestep')
-plt.tight_layout()
-plt.savefig('SNN_STDP/raster_before_after.png', dpi=150, bbox_inches='tight')
-plt.close()
+            ax2.scatter(ts, [nid] * len(ts), s=1.5, c='#333333', marker='|')
+    ax2.set_xlabel('Timestep')
+    ax2.set_ylabel('Input Neuron Index')
+    ax2.set_title('Spike Train – Poisson Encoding (first 100 neurons)')
+    ax2.set_xlim(0, T_STEPS)
+    ax2.set_facecolor('#fafafa')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'spike_encoding.png', dpi=150, bbox_inches='tight')
+    plt.close()
 
-print("\nSTDP training complete")
-print(f"  Architecture : {N_INPUT} → {N_HIDDEN} (LIF)")
-print(f"  Encoding     : Poisson Rate Coding ({T_STEPS} timesteps)")
-print(f"  W_mean       : {W_init.mean():.4f} → {W.mean():.4f}")
-print("Plots saved → SNN_STDP/")
+    # ---------------------------------------------------------------------------
+    # STDP training loop
+    # ---------------------------------------------------------------------------
+    np.random.seed(1)
+    W = np.random.uniform(0.0, 0.3, (N_INPUT, N_HIDDEN)).astype(np.float32)
+
+    N_EPOCHS  = 20
+    N_SAMPLES = 200
+    dw_history = []
+
+    for epoch in range(N_EPOCHS):
+        dw_total = np.zeros_like(W)
+        for s in range(N_SAMPLES):
+            rates, _ = get_sample(s)
+            sp_in    = poisson_encode(rates, T_STEPS)
+            sp_out   = lif_forward(sp_in, W)
+            dw_total += stdp_update(sp_in, sp_out, W)
+
+        W = np.clip(W + dw_total / N_SAMPLES, W_MIN, W_MAX)
+        dw_history.append(np.abs(dw_total).mean())
+
+        if (epoch + 1) % 5 == 0:
+            print(f"  Epoch {epoch+1:2d}/{N_EPOCHS} | ΔW = {dw_history[-1]:.6f} | W_mean = {W.mean():.4f}")
+
+    # ---------------------------------------------------------------------------
+    # Visualisation
+    # ---------------------------------------------------------------------------
+    W_init = np.random.uniform(0.0, 0.3, (N_INPUT, N_HIDDEN))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].plot(dw_history, color='#e15759', linewidth=2, marker='o', markersize=4)
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Mean |ΔW|')
+    axes[0].set_title('Weight Convergence over Epochs')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_facecolor('#fafafa')
+
+    axes[1].hist(W_init.flatten(), bins=50, alpha=0.6, color='#4e79a7',
+                 label='Initialisation', density=True)
+    axes[1].hist(W.flatten(), bins=50, alpha=0.6, color='#f28e2b',
+                 label='After STDP', density=True)
+    axes[1].set_xlabel('Weight Value')
+    axes[1].set_ylabel('Probability Density')
+    axes[1].set_title('Weight Distribution Before / After STDP')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_facecolor('#fafafa')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'stdp_weights.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Receptive fields of hidden layer neurons
+    fig, axes = plt.subplots(4, 4, figsize=(10, 10))
+    fig.suptitle('Receptive Fields – 16 Hidden Neurons (post-STDP)', fontsize=12, fontweight='bold')
+    for i, ax in enumerate(axes.flatten()):
+        im = ax.imshow(W[:, i].reshape(28, 28), cmap='RdBu_r',
+                       vmin=W_MIN, vmax=W_MAX, interpolation='nearest')
+        ax.axis('off')
+        ax.set_title(f'H{i}', fontsize=7)
+    plt.colorbar(im, ax=axes.flatten()[-1], fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'receptive_fields.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Raster plot before / after STDP
+    fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharey=True)
+    fig.suptitle('Hidden Layer Activity – Before and After STDP', fontsize=12)
+    for ax, W_plot, title, col in [
+        (axes[0], W_init.astype(np.float32), 'Before STDP', '#4e79a7'),
+        (axes[1], W,                          'After STDP',  '#e15759'),
+    ]:
+        sp = lif_forward(spike_train0, W_plot)
+        for nid in range(N_HIDDEN):
+            ts = np.where(sp[:, nid])[0]
+            if len(ts):
+                ax.scatter(ts, [nid] * len(ts), s=2.5, c=col, marker='|')
+        ax.set_ylabel('Hidden Neuron')
+        ax.set_title(f'{title} | Total spikes = {sp.sum():.0f}')
+        ax.set_facecolor('#fafafa')
+    axes[-1].set_xlabel('Timestep')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'raster_before_after.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print("\nSTDP training complete")
+    print(f"  Architecture : {N_INPUT} → {N_HIDDEN} (LIF)")
+    print(f"  Encoding     : Poisson Rate Coding ({T_STEPS} timesteps)")
+    print(f"  W_mean       : {W_init.mean():.4f} → {W.mean():.4f}")
+    print("Plots saved → SNN_STDP/")

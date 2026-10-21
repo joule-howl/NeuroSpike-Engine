@@ -17,7 +17,11 @@ import matplotlib.gridspec as gridspec
 import matplotlib.patches as patches
 import time
 import warnings
+from pathlib import Path
+
 warnings.filterwarnings('ignore')
+
+OUTPUT_DIR = Path(__file__).parent
 
 
 # ---------------------------------------------------------------------------
@@ -217,150 +221,152 @@ class MovingObject:
         return np.clip(frame, 0, 1)
 
 
-# ---------------------------------------------------------------------------
-# Full system simulation
-# ---------------------------------------------------------------------------
-np.random.seed(3)
-W_CAM, H_CAM = 64, 64
-N_FRAMES     = 150
+if __name__ == '__main__':
+    # ---------------------------------------------------------------------------
+    # Full system simulation
+    # ---------------------------------------------------------------------------
+    np.random.seed(3)
+    W_CAM, H_CAM = 64, 64
+    N_FRAMES     = 150
 
-dvs_cam  = DVSCamera(W_CAM, H_CAM, threshold=0.08, noise_rate=0.005)
-acc      = EventAccumulator(W_CAM, H_CAM)
-detector = SNNDetector(in_size=W_CAM * H_CAM)
-obj      = MovingObject(W_CAM, H_CAM)
+    dvs_cam  = DVSCamera(W_CAM, H_CAM, threshold=0.08, noise_rate=0.005)
+    acc      = EventAccumulator(W_CAM, H_CAM)
+    detector = SNNDetector(in_size=W_CAM * H_CAM)
+    obj      = MovingObject(W_CAM, H_CAM)
 
-dvs_cam.update(obj.render())   # initialise log-frame
+    dvs_cam.update(obj.render())   # initialise log-frame
 
-tracker                      = None
-latencies, energies          = [], []
-track_cx, track_cy           = [], []
-detect_cx, detect_cy         = [], []
-gt_cx,     gt_cy             = [], []
-event_counts                 = []
+    tracker                      = None
+    latencies, energies          = [], []
+    track_cx, track_cy           = [], []
+    detect_cx, detect_cy         = [], []
+    gt_cx,     gt_cy             = [], []
+    event_counts                 = []
 
-P_SNN_mW = 12.0    # SNN on Akida / Loihi: ~12 mW
-P_CNN_mW = 800.0   # Equivalent CNN on edge GPU: ~800 mW
+    P_SNN_mW = 12.0    # SNN on Akida / Loihi: ~12 mW
+    P_CNN_mW = 800.0   # Equivalent CNN on edge GPU: ~800 mW
 
-print("Running neuromorphic edge AI simulation...")
-for _ in range(N_FRAMES):
-    obj.step()
-    frame = obj.render()
+    print("Running neuromorphic edge AI simulation...")
+    for _ in range(N_FRAMES):
+        obj.step()
+        frame = obj.render()
 
-    t0          = time.perf_counter()
-    events      = dvs_cam.update(frame)
-    event_frame = acc.accumulate(events)
+        t0          = time.perf_counter()
+        events      = dvs_cam.update(frame)
+        event_frame = acc.accumulate(events)
 
-    cx_det, cy_det, conf = detector.detect(event_frame)
-    latency_ms           = (time.perf_counter() - t0) * 1000
+        cx_det, cy_det, conf = detector.detect(event_frame)
+        latency_ms           = (time.perf_counter() - t0) * 1000
 
-    cx_px = cx_det * W_CAM
-    cy_px = cy_det * H_CAM
+        cx_px = cx_det * W_CAM
+        cy_px = cy_det * H_CAM
 
-    if tracker is None:
-        tracker = KalmanTracker((cx_px, cy_px))
-    else:
-        tracker.predict()
-        if conf > 0.1:
-            tracker.update(np.array([cx_px, cy_px]))
+        if tracker is None:
+            tracker = KalmanTracker((cx_px, cy_px))
+        else:
+            tracker.predict()
+            if conf > 0.1:
+                tracker.update(np.array([cx_px, cy_px]))
 
-    cx_track, cy_track = tracker.x[:2]
+        cx_track, cy_track = tracker.x[:2]
 
-    n_events   = len(events)
-    e_snn      = P_SNN_mW * latency_ms / 1000 * (n_events / (W_CAM * H_CAM))
-    e_cnn      = P_CNN_mW * (1.0 / 30)   # CNN processes every frame @ 30 fps
+        n_events   = len(events)
+        e_snn      = P_SNN_mW * latency_ms / 1000 * (n_events / (W_CAM * H_CAM))
+        e_cnn      = P_CNN_mW * (1.0 / 30)   # CNN processes every frame @ 30 fps
 
-    latencies.append(latency_ms)
-    energies.append((e_snn, e_cnn))
-    track_cx.append(cx_track);  track_cy.append(cy_track)
-    detect_cx.append(cx_px);    detect_cy.append(cy_px)
-    gt_cx.append(obj.cx);       gt_cy.append(obj.cy)
-    event_counts.append(n_events)
+        latencies.append(latency_ms)
+        energies.append((e_snn, e_cnn))
+        track_cx.append(cx_track);  track_cy.append(cy_track)
+        detect_cx.append(cx_px);    detect_cy.append(cy_px)
+        gt_cx.append(obj.cx);       gt_cy.append(obj.cy)
+        event_counts.append(n_events)
 
-latencies  = np.array(latencies)
-energies   = np.array(energies)
-track_err  = np.sqrt((np.array(track_cx) - np.array(gt_cx)) ** 2 +
-                      (np.array(track_cy) - np.array(gt_cy)) ** 2)
+    latencies  = np.array(latencies)
+    energies   = np.array(energies)
+    track_err  = np.sqrt((np.array(track_cx) - np.array(gt_cx)) ** 2 +
+                          (np.array(track_cy) - np.array(gt_cy)) ** 2)
 
-print(f"\nSimulation results ({N_FRAMES} frames):")
-print(f"  Mean latency       : {latencies.mean():.2f} ms  (max: {latencies.max():.2f} ms)")
-print(f"  Tracking MAE       : {track_err.mean():.2f} px")
-print(f"  Events/frame       : {np.mean(event_counts):.0f}  "
-      f"({np.mean(event_counts)/(W_CAM*H_CAM)*100:.1f}% of pixels)")
-print(f"  SNN total energy   : {energies[:,0].sum()*1000:.2f} µJ")
-print(f"  CNN ref. energy    : {energies[:,1].sum()*1000:.2f} µJ")
-print(f"  Energy saving      : {(1 - energies[:,0].sum()/energies[:,1].sum())*100:.1f}%")
+    print(f"\nSimulation results ({N_FRAMES} frames):")
+    print(f"  Mean latency       : {latencies.mean():.2f} ms  (max: {latencies.max():.2f} ms)")
+    print(f"  Tracking MAE       : {track_err.mean():.2f} px")
+    print(f"  Events/frame       : {np.mean(event_counts):.0f}  "
+          f"({np.mean(event_counts)/(W_CAM*H_CAM)*100:.1f}% of pixels)")
+    print(f"  SNN total energy   : {energies[:,0].sum()*1000:.2f} µJ")
+    print(f"  CNN ref. energy    : {energies[:,1].sum()*1000:.2f} µJ")
+    print(f"  Energy saving      : {(1 - energies[:,0].sum()/energies[:,1].sum())*100:.1f}%")
 
-# ---------------------------------------------------------------------------
-# Plots
-# ---------------------------------------------------------------------------
-fig = plt.figure(figsize=(16, 12))
-gs  = gridspec.GridSpec(2, 3, hspace=0.4, wspace=0.35)
+    # ---------------------------------------------------------------------------
+    # Plots
+    # ---------------------------------------------------------------------------
+    fig = plt.figure(figsize=(16, 12))
+    gs  = gridspec.GridSpec(2, 3, hspace=0.4, wspace=0.35)
 
-ax = fig.add_subplot(gs[0, 0])
-ax.plot(gt_cx,     gt_cy,     'k-',  lw=1.0,  alpha=0.5, label='Ground truth')
-ax.plot(detect_cx, detect_cy, 'b.',  ms=2,    alpha=0.5, label='SNN detection')
-ax.plot(track_cx,  track_cy,  'r-',  lw=1.5,  alpha=0.8, label='Kalman track')
-ax.scatter(gt_cx[0], gt_cy[0], c='green', s=60, zorder=5, marker='o', label='Start')
-ax.scatter(gt_cx[-1], gt_cy[-1], c='red', s=60, zorder=5, marker='x')
-ax.set_xlim(0, W_CAM); ax.set_ylim(0, H_CAM)
-ax.set_xlabel('X (px)'); ax.set_ylabel('Y (px)')
-ax.set_title('Object Trajectory – SNN + Kalman Tracker')
-ax.legend(fontsize=8)
-ax.set_facecolor('#fafafa')
-ax.invert_yaxis()
+    ax = fig.add_subplot(gs[0, 0])
+    ax.plot(gt_cx,     gt_cy,     'k-',  lw=1.0,  alpha=0.5, label='Ground truth')
+    ax.plot(detect_cx, detect_cy, 'b.',  ms=2,    alpha=0.5, label='SNN detection')
+    ax.plot(track_cx,  track_cy,  'r-',  lw=1.5,  alpha=0.8, label='Kalman track')
+    ax.scatter(gt_cx[0], gt_cy[0], c='green', s=60, zorder=5, marker='o', label='Start')
+    ax.scatter(gt_cx[-1], gt_cy[-1], c='red', s=60, zorder=5, marker='x')
+    ax.set_xlim(0, W_CAM); ax.set_ylim(0, H_CAM)
+    ax.set_xlabel('X (px)'); ax.set_ylabel('Y (px)')
+    ax.set_title('Object Trajectory – SNN + Kalman Tracker')
+    ax.legend(fontsize=8)
+    ax.set_facecolor('#fafafa')
+    ax.invert_yaxis()
 
-ax = fig.add_subplot(gs[0, 1])
-ax.plot(track_err, color='#e15759', lw=1.2)
-ax.axhline(track_err.mean(), color='navy', linestyle='--',
-           lw=1, label=f'MAE = {track_err.mean():.2f} px')
-ax.fill_between(range(N_FRAMES), track_err, alpha=0.15, color='#e15759')
-ax.set_xlabel('Frame'); ax.set_ylabel('Tracking Error (px)')
-ax.set_title('Tracking Error over Time')
-ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
+    ax = fig.add_subplot(gs[0, 1])
+    ax.plot(track_err, color='#e15759', lw=1.2)
+    ax.axhline(track_err.mean(), color='navy', linestyle='--',
+               lw=1, label=f'MAE = {track_err.mean():.2f} px')
+    ax.fill_between(range(N_FRAMES), track_err, alpha=0.15, color='#e15759')
+    ax.set_xlabel('Frame'); ax.set_ylabel('Tracking Error (px)')
+    ax.set_title('Tracking Error over Time')
+    ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-ax = fig.add_subplot(gs[0, 2])
-ax.plot(latencies, color='#4e79a7', lw=1.0)
-ax.axhline(latencies.mean(), color='red', linestyle='--',
-           label=f'Mean = {latencies.mean():.2f} ms')
-ax.set_xlabel('Frame'); ax.set_ylabel('Latency (ms)')
-ax.set_title('End-to-End Inference Latency')
-ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
+    ax = fig.add_subplot(gs[0, 2])
+    ax.plot(latencies, color='#4e79a7', lw=1.0)
+    ax.axhline(latencies.mean(), color='red', linestyle='--',
+               label=f'Mean = {latencies.mean():.2f} ms')
+    ax.set_xlabel('Frame'); ax.set_ylabel('Latency (ms)')
+    ax.set_title('End-to-End Inference Latency')
+    ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-ax = fig.add_subplot(gs[1, 0])
-ax.bar(range(N_FRAMES), event_counts, color='#76b7b2', alpha=0.7, width=1.0)
-ax.axhline(W_CAM * H_CAM, color='red', linestyle='--',
-           lw=1, label=f'Full frame = {W_CAM*H_CAM} px')
-ax.set_xlabel('Frame'); ax.set_ylabel('Event Count')
-ax.set_title('DVS Events vs. Full Frame\n(event-driven = process only changes)')
-ax.legend(fontsize=8); ax.set_facecolor('#fafafa')
+    ax = fig.add_subplot(gs[1, 0])
+    ax.bar(range(N_FRAMES), event_counts, color='#76b7b2', alpha=0.7, width=1.0)
+    ax.axhline(W_CAM * H_CAM, color='red', linestyle='--',
+               lw=1, label=f'Full frame = {W_CAM*H_CAM} px')
+    ax.set_xlabel('Frame'); ax.set_ylabel('Event Count')
+    ax.set_title('DVS Events vs. Full Frame\n(event-driven = process only changes)')
+    ax.legend(fontsize=8); ax.set_facecolor('#fafafa')
 
-ax = fig.add_subplot(gs[1, 1])
-ax.plot(np.cumsum(energies[:, 0]) * 1000, color='#59a14f', lw=2, label='SNN (Neuromorphic)')
-ax.plot(np.cumsum(energies[:, 1]) * 1000, color='#e15759', lw=2, label='CNN (Edge GPU)')
-ax.set_xlabel('Frame'); ax.set_ylabel('Cumulative Energy (µJ)')
-ax.set_title('Cumulative Energy Consumption')
-ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
+    ax = fig.add_subplot(gs[1, 1])
+    ax.plot(np.cumsum(energies[:, 0]) * 1000, color='#59a14f', lw=2, label='SNN (Neuromorphic)')
+    ax.plot(np.cumsum(energies[:, 1]) * 1000, color='#e15759', lw=2, label='CNN (Edge GPU)')
+    ax.set_xlabel('Frame'); ax.set_ylabel('Cumulative Energy (µJ)')
+    ax.set_title('Cumulative Energy Consumption')
+    ax.legend(); ax.grid(True, alpha=0.3); ax.set_facecolor('#fafafa')
 
-ax = fig.add_subplot(gs[1, 2])
-obj_demo = MovingObject(W_CAM, H_CAM)
-dvs_demo = DVSCamera(W_CAM, H_CAM, threshold=0.08)
-dvs_demo.update(obj_demo.render())
-for _ in range(5):
-    obj_demo.step()
-ev_demo = dvs_demo.update(obj_demo.render())
-ef_demo = acc.accumulate(ev_demo)
-im = ax.imshow(ef_demo, cmap='RdBu_r', vmin=0, vmax=1, interpolation='nearest')
-cx_d, cy_d, conf_d = detector.detect(ef_demo)
-ax.add_patch(patches.Circle(
-    (cx_d * W_CAM, cy_d * H_CAM), radius=6,
-    edgecolor='yellow', facecolor='none', linewidth=2
-))
-ax.set_title(f'Sample Event Frame\nConf={conf_d:.2f}  ({len(ev_demo)} events)')
-ax.axis('off')
-plt.colorbar(im, ax=ax, fraction=0.04, pad=0.04)
+    ax = fig.add_subplot(gs[1, 2])
+    obj_demo = MovingObject(W_CAM, H_CAM)
+    dvs_demo = DVSCamera(W_CAM, H_CAM, threshold=0.08)
+    dvs_demo.update(obj_demo.render())
+    for _ in range(5):
+        obj_demo.step()
+    ev_demo = dvs_demo.update(obj_demo.render())
+    ef_demo = acc.accumulate(ev_demo)
+    im = ax.imshow(ef_demo, cmap='RdBu_r', vmin=0, vmax=1, interpolation='nearest')
+    cx_d, cy_d, conf_d = detector.detect(ef_demo)
+    ax.add_patch(patches.Circle(
+        (cx_d * W_CAM, cy_d * H_CAM), radius=6,
+        edgecolor='yellow', facecolor='none', linewidth=2
+    ))
+    ax.set_title(f'Sample Event Frame\nConf={conf_d:.2f}  ({len(ev_demo)} events)')
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, fraction=0.04, pad=0.04)
 
-fig.suptitle('Neuromorphic Edge AI – Event-based Vision & Object Tracking',
-             fontsize=14, fontweight='bold')
-plt.savefig('EdgeAI/edge_ai_results.png', dpi=150, bbox_inches='tight')
-plt.close()
-print("\nPlot saved → EdgeAI/edge_ai_results.png")
+    fig.suptitle('Neuromorphic Edge AI – Event-based Vision & Object Tracking',
+                 fontsize=14, fontweight='bold')
+    plt.savefig(OUTPUT_DIR / 'edge_ai_results.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("\nPlot saved → EdgeAI/edge_ai_results.png")
+

@@ -28,6 +28,9 @@ Reference:
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from pathlib import Path
+
+OUTPUT_DIR = Path(__file__).parent
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
@@ -102,31 +105,33 @@ def update_eligibility(elig: np.ndarray,
                        t: int) -> np.ndarray:
     """
     Update eligibility trace for each synapse (i→j):
-      e[i,j] += STDP_kernel(t_pre, t_post)
+      e[i,j] += STDP_kernel(t_pre[i], t_post[j])
       e[i,j] *= exp(-1/tau_elig)  [decay each step]
 
-    The eligibility trace is the "memory" that holds candidate weight
-    changes until the dopamine signal arrives.
+    Correct rule: only update synapse (i→j) based on the actual timing
+    of pre neuron i and post neuron j — not all-to-all combinations.
+      LTP: post_j just fired → e[i,j] += A+ * exp(-(t - t_pre[i]) / tau+)
+      LTD: pre_i just fired  → e[i,j] += A- * exp(-(t - t_post[j]) / tau-)
     """
     # Decay existing traces
     elig *= np.exp(-1.0 / TAU_ELIG)
 
-    pre  = sp_pre.astype(bool)
-    post = sp_post.astype(bool)
+    pre  = sp_pre.astype(bool)   # (N_IN,)
+    post = sp_post.astype(bool)  # (N_OUT,)
 
-    # LTP component: post fired, look back at recent pre activity
-    if post.any() and t_pre_last.max() > -999:
-        dt  = t - t_pre_last          # [n_in]
-        ltp = A_PLUS * np.exp(-dt / TAU_PLUS)
-        ltp[dt < 0] = 0
-        elig[np.ix_(np.ones(len(sp_pre), bool), post)] += ltp[:, np.newaxis]
+    # LTP: post_j fired — for each active post_j, accumulate LTP trace
+    # from all pre neurons weighted by how recently pre_i fired.
+    if post.any():
+        dt  = t - t_pre_last              # (N_IN,)  time since each pre fired
+        ltp = np.where(dt > 0, A_PLUS * np.exp(-dt / TAU_PLUS), 0.0)
+        elig[:, post] += ltp[:, np.newaxis]
 
-    # LTD component: pre fired, look back at recent post activity
-    if pre.any() and t_post_last.max() > -999:
-        dt  = t - t_post_last         # [n_out]
-        ltd = A_MINUS * np.exp(-dt / TAU_MINUS)
-        ltd[dt < 0] = 0
-        elig[np.ix_(pre, np.ones(len(sp_post), bool))] += ltd[np.newaxis, :]
+    # LTD: pre_i fired — for each active pre_i, accumulate LTD trace
+    # weighted by how recently post_j fired.
+    if pre.any():
+        dt  = t - t_post_last             # (N_OUT,)  time since each post fired
+        ltd = np.where(dt > 0, A_MINUS * np.exp(-dt / TAU_MINUS), 0.0)
+        elig[pre, :] += ltd[np.newaxis, :]
 
     return elig
 
@@ -211,119 +216,112 @@ def train(use_reward: bool = True):
     return W, accuracy_log, reward_log
 
 
-# ---------------------------------------------------------------------------
-# Run both variants
-# ---------------------------------------------------------------------------
-print("=" * 55)
-print("  Reward-Modulated STDP vs Vanilla STDP")
-print("=" * 55)
+if __name__ == '__main__':
+    # ---------------------------------------------------------------------------
+    # Run both variants
+    # ---------------------------------------------------------------------------
+    print("=" * 55)
+    print("  Reward-Modulated STDP vs Vanilla STDP")
+    print("=" * 55)
 
-print("\n[1/2] Training with Reward-Modulated STDP...")
-W_r, acc_r, rew_r = train(use_reward=True)
+    print("\n[1/2] Training with Reward-Modulated STDP...")
+    W_r, acc_r, rew_r = train(use_reward=True)
 
-print("\n[2/2] Training with Vanilla STDP...")
-W_v, acc_v, rew_v = train(use_reward=False)
+    print("\n[2/2] Training with Vanilla STDP...")
+    W_v, acc_v, rew_v = train(use_reward=False)
 
-# Final evaluation
-def evaluate(W, n_eval=200):
-    correct = 0
-    for i in range(n_eval):
-        pid = i % 2
-        dec, _, _, _ = run_trial(W, pid)
-        correct += int(dec == pid)
-    return correct / n_eval
+    # Final evaluation
+    acc_final_r = evaluate(W_r)
+    acc_final_v = evaluate(W_v)
+    print(f"\nFinal accuracy — R-STDP   : {acc_final_r*100:.1f}%")
+    print(f"Final accuracy — Vanilla  : {acc_final_v*100:.1f}%")
+    print(f"Improvement from reward   : +{(acc_final_r - acc_final_v)*100:.1f}%")
 
-acc_final_r = evaluate(W_r)
-acc_final_v = evaluate(W_v)
-print(f"\nFinal accuracy — R-STDP   : {acc_final_r*100:.1f}%")
-print(f"Final accuracy — Vanilla  : {acc_final_v*100:.1f}%")
-print(f"Improvement from reward   : +{(acc_final_r - acc_final_v)*100:.1f}%")
+    # ---------------------------------------------------------------------------
+    # Visualisation
+    # ---------------------------------------------------------------------------
+    fig = plt.figure(figsize=(16, 12))
+    gs  = gridspec.GridSpec(2, 3, hspace=0.4, wspace=0.35)
 
+    # Learning curves
+    ax = fig.add_subplot(gs[0, 0])
+    x  = [(i + 1) * 200 for i in range(len(acc_r))]
+    ax.plot(x, [a * 100 for a in acc_r], color='#e15759', lw=2, label='R-STDP')
+    ax.plot(x, [a * 100 for a in acc_v], color='#4e79a7', lw=2, label='Vanilla STDP')
+    ax.axhline(50, color='gray', linestyle='--', lw=1, alpha=0.6, label='Chance (50%)')
+    ax.set_xlabel('Trial')
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title('Learning Curve: R-STDP vs Vanilla STDP')
+    ax.legend(fontsize=9)
+    ax.set_ylim(0, 105)
+    ax.grid(True, alpha=0.3)
+    ax.set_facecolor('#fafafa')
 
-# ---------------------------------------------------------------------------
-# Visualisation
-# ---------------------------------------------------------------------------
-fig = plt.figure(figsize=(16, 12))
-gs  = gridspec.GridSpec(2, 3, hspace=0.4, wspace=0.35)
+    # Reward signal over time
+    ax = fig.add_subplot(gs[0, 1])
+    window = 50
+    smoothed = np.convolve(rew_r, np.ones(window)/window, mode='valid')
+    ax.plot(smoothed, color='#59a14f', lw=1.5, label='Smoothed reward (R-STDP)')
+    ax.axhline(0, color='gray', linestyle='--', lw=0.8, alpha=0.5)
+    ax.fill_between(range(len(smoothed)), smoothed, 0,
+                    where=(smoothed > 0), alpha=0.2, color='#59a14f')
+    ax.fill_between(range(len(smoothed)), smoothed, 0,
+                    where=(smoothed < 0), alpha=0.2, color='#e15759')
+    ax.set_xlabel('Trial')
+    ax.set_ylabel('Dopamine signal')
+    ax.set_title('Reward Signal over Training')
+    ax.grid(True, alpha=0.3)
+    ax.set_facecolor('#fafafa')
 
-# Learning curves
-ax = fig.add_subplot(gs[0, 0])
-x  = [(i + 1) * 200 for i in range(len(acc_r))]
-ax.plot(x, [a * 100 for a in acc_r], color='#e15759', lw=2, label='R-STDP')
-ax.plot(x, [a * 100 for a in acc_v], color='#4e79a7', lw=2, label='Vanilla STDP')
-ax.axhline(50, color='gray', linestyle='--', lw=1, alpha=0.6, label='Chance (50%)')
-ax.set_xlabel('Trial')
-ax.set_ylabel('Accuracy (%)')
-ax.set_title('Learning Curve: R-STDP vs Vanilla STDP')
-ax.legend(fontsize=9)
-ax.set_ylim(0, 105)
-ax.grid(True, alpha=0.3)
-ax.set_facecolor('#fafafa')
+    # Weight matrices
+    for ax_idx, (W_plot, title, col) in enumerate([
+        (W_r, 'Weights after R-STDP', gs[0, 2]),
+        (W_v, 'Weights after Vanilla STDP', gs[1, 0]),
+    ]):
+        ax = fig.add_subplot(col)
+        im = ax.imshow(W_plot.T, aspect='auto', cmap='RdBu_r',
+                       vmin=0, vmax=W_MAX, interpolation='nearest')
+        ax.set_xlabel('Input Neuron')
+        ax.set_ylabel('Output Neuron')
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.04, pad=0.04)
 
-# Reward signal over time
-ax = fig.add_subplot(gs[0, 1])
-window = 50
-smoothed = np.convolve(rew_r, np.ones(window)/window, mode='valid')
-ax.plot(smoothed, color='#59a14f', lw=1.5, label='Smoothed reward (R-STDP)')
-ax.axhline(0, color='gray', linestyle='--', lw=0.8, alpha=0.5)
-ax.fill_between(range(len(smoothed)), smoothed, 0,
-                where=(smoothed > 0), alpha=0.2, color='#59a14f')
-ax.fill_between(range(len(smoothed)), smoothed, 0,
-                where=(smoothed < 0), alpha=0.2, color='#e15759')
-ax.set_xlabel('Trial')
-ax.set_ylabel('Dopamine signal')
-ax.set_title('Reward Signal over Training')
-ax.grid(True, alpha=0.3)
-ax.set_facecolor('#fafafa')
+    # Spike raster for one trial (R-STDP trained model)
+    ax = fig.add_subplot(gs[1, 1])
+    _, _, sp_in_A, sp_out_A = run_trial(W_r, pattern_id=0)
+    _, _, sp_in_B, sp_out_B = run_trial(W_r, pattern_id=1)
+    # Input raster (first 20 neurons)
+    for nid in range(20):
+        ts = np.where(sp_in_A[:, nid])[0]
+        if len(ts):
+            ax.scatter(ts, [nid]*len(ts), s=8, c='#4e79a7', marker='|')
+        ts = np.where(sp_in_B[:, nid])[0]
+        if len(ts):
+            ax.scatter(ts + T_STEPS + 3, [nid]*len(ts), s=8, c='#e15759', marker='|')
+    ax.axvline(T_STEPS + 1.5, color='gray', lw=1, linestyle='--')
+    ax.set_xlabel('Timestep')
+    ax.set_ylabel('Input Neuron')
+    ax.set_title('Input Spike Patterns (Blue=A, Red=B)')
+    ax.set_facecolor('#fafafa')
 
-# Weight matrices
-for ax_idx, (W_plot, title, col) in enumerate([
-    (W_r, 'Weights after R-STDP', gs[0, 2]),
-    (W_v, 'Weights after Vanilla STDP', gs[1, 0]),
-]):
-    ax = fig.add_subplot(col)
-    im = ax.imshow(W_plot.T, aspect='auto', cmap='RdBu_r',
-                   vmin=0, vmax=W_MAX, interpolation='nearest')
-    ax.set_xlabel('Input Neuron')
-    ax.set_ylabel('Output Neuron')
-    ax.set_title(title)
-    plt.colorbar(im, ax=ax, fraction=0.04, pad=0.04)
+    # Final accuracy bar chart
+    ax = fig.add_subplot(gs[1, 2])
+    labels = ['R-STDP\n(with dopamine)', 'Vanilla STDP\n(no reward)', 'Chance']
+    vals   = [acc_final_r * 100, acc_final_v * 100, 50.0]
+    colors = ['#e15759', '#4e79a7', '#999999']
+    bars   = ax.bar(labels, vals, color=colors, alpha=0.85, edgecolor='white')
+    for bar, val in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                f'{val:.1f}%', ha='center', fontsize=10, fontweight='bold')
+    ax.set_ylabel('Classification Accuracy (%)')
+    ax.set_title('Final Accuracy Comparison')
+    ax.set_ylim(0, 115)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_facecolor('#fafafa')
 
-# Spike raster for one trial (R-STDP trained model)
-ax = fig.add_subplot(gs[1, 1])
-_, _, sp_in_A, sp_out_A = run_trial(W_r, pattern_id=0)
-_, _, sp_in_B, sp_out_B = run_trial(W_r, pattern_id=1)
-# Input raster (first 20 neurons)
-for nid in range(20):
-    ts = np.where(sp_in_A[:, nid])[0]
-    if len(ts):
-        ax.scatter(ts, [nid]*len(ts), s=8, c='#4e79a7', marker='|')
-    ts = np.where(sp_in_B[:, nid])[0]
-    if len(ts):
-        ax.scatter(ts + T_STEPS + 3, [nid]*len(ts), s=8, c='#e15759', marker='|')
-ax.axvline(T_STEPS + 1.5, color='gray', lw=1, linestyle='--')
-ax.set_xlabel('Timestep')
-ax.set_ylabel('Input Neuron')
-ax.set_title('Input Spike Patterns (Blue=A, Red=B)')
-ax.set_facecolor('#fafafa')
+    fig.suptitle('Reward-Modulated STDP – Biologically Plausible Reinforcement Learning',
+                 fontsize=13, fontweight='bold')
+    plt.savefig(OUTPUT_DIR / 'reward_stdp.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("\nPlot saved → Learning/reward_stdp.png")
 
-# Final accuracy bar chart
-ax = fig.add_subplot(gs[1, 2])
-labels = ['R-STDP\n(with dopamine)', 'Vanilla STDP\n(no reward)', 'Chance']
-vals   = [acc_final_r * 100, acc_final_v * 100, 50.0]
-colors = ['#e15759', '#4e79a7', '#999999']
-bars   = ax.bar(labels, vals, color=colors, alpha=0.85, edgecolor='white')
-for bar, val in zip(bars, vals):
-    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-            f'{val:.1f}%', ha='center', fontsize=10, fontweight='bold')
-ax.set_ylabel('Classification Accuracy (%)')
-ax.set_title('Final Accuracy Comparison')
-ax.set_ylim(0, 115)
-ax.grid(True, alpha=0.3, axis='y')
-ax.set_facecolor('#fafafa')
-
-fig.suptitle('Reward-Modulated STDP – Biologically Plausible Reinforcement Learning',
-             fontsize=13, fontweight='bold')
-plt.savefig('Learning/reward_stdp.png', dpi=150, bbox_inches='tight')
-plt.close()
-print("\nPlot saved → Learning/reward_stdp.png")
