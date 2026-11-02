@@ -54,9 +54,9 @@ np.random.seed(0)
 N_INPUT   = 784    # 28×28 — MNIST-like
 N_HIDDEN  = 128
 N_OUTPUT  = 10     # 10 digit classes
-LR        = 0.01   # learning rate
-LR_PRED   = 0.05   # prediction weight learning rate
-T_INFER   = 20     # inference steps per sample (local relaxation)
+LR        = 0.01   # learning rate (representation update)
+LR_PRED   = 0.005  # prediction weight learning rate — half of LR for stability
+T_INFER   = 10     # inference steps per sample (fewer = less overfitting)
 N_EPOCHS  = 10
 N_TRAIN   = 500    # samples to demo (small for speed)
 SIGMA     = 0.1    # prediction noise level
@@ -98,6 +98,10 @@ class PCLayer:
     def _relu_grad(x):
         return (x > 0).astype(np.float32)
 
+    @staticmethod
+    def _relu_init(x: np.ndarray) -> np.ndarray:
+        return np.maximum(0, x).astype(np.float32)
+
     def predict(self) -> np.ndarray:
         """Generate prediction of the layer below from current representation."""
         return self._relu(self.W_down.T @ self.r)
@@ -105,13 +109,20 @@ class PCLayer:
     def update_representation(self, error_below: np.ndarray,
                                error_above: np.ndarray,
                                lr: float = LR):
-        bu = self.W_down @ error_below
-        td = -error_above if error_above is not None else 0
-        self.r = np.clip(self._relu(self.r + lr * (bu + td)), 0, 10)
+        # Bottom-up: recognition weights (W_up.T = W_down) map error to representation space
+        # W_up shape: (n_in, n_out) → W_up.T @ error_below: (n_out, n_in) @ (n_in,) = (n_out,)
+        bu = self.W_up.T @ error_below
+        # Top-down: error_above is already in representation space — subtract to suppress
+        td = error_above if error_above is not None else 0
+        self.r = np.clip(self._relu(self.r + lr * (bu - td)), 0, 10)
 
     def update_weights(self, error_below: np.ndarray, lr: float = LR_PRED):
+        # Minimise ||error_below||²: gradient w.r.t. W_down is outer(r, error_below)
+        # Gradient descent: W_down += lr * outer(r, error_below) reduces prediction error
         dW = lr * np.outer(self.r, error_below)
-        self.W_down = np.clip(self.W_down + dW, -2.0, 2.0)
+        # Clip dW magnitude to prevent runaway updates
+        dW = np.clip(dW, -0.1, 0.1)
+        self.W_down = np.clip(self.W_down + dW, -1.5, 1.5)
         self.W_up   = self.W_down.T.copy()
 
 
@@ -166,11 +177,12 @@ class PredictiveCodingNetwork:
                 error_below=err_h, error_above=None)
 
             # Clamp output layer if label is known (supervised signal)
+            # Moderate clamp (0.4) balances label guidance with free inference
             if label is not None:
                 target = np.zeros(N_OUTPUT, dtype=np.float32)
                 target[label] = 1.0
                 self.layers[1].r = (
-                    0.7 * self.layers[1].r + 0.3 * target)
+                    0.6 * self.layers[1].r + 0.4 * target)
 
             errors_history.append((
                 np.mean(err_x ** 2),
@@ -205,6 +217,11 @@ class PredictiveCodingNetwork:
 
         self.layers[0].update_weights(err_x)
         self.layers[1].update_weights(err_h)
+
+        # Weight decay: gentle L2 to prevent runaway growth across epochs
+        for layer in self.layers:
+            layer.W_down *= 0.999
+            layer.W_up    = layer.W_down.T.copy()
 
         # Update output representation toward one-hot target (supervised clamp)
         target = np.zeros(N_OUTPUT, dtype=np.float32)
@@ -266,20 +283,24 @@ if __name__ == '__main__':
     pred_error_ratio = []   # ratio of error transmitted vs full signal
 
     for epoch in range(N_EPOCHS):
-        correct   = 0
         e1_epoch, e2_epoch = [], []
-        err_norm_epoch, sig_norm_epoch = [], []
+        err_norm_epoch = []
         idx = np.random.permutation(N_TRAIN)
 
         for i in idx:
-            pred, (e1, e2) = net.learn(X_train[i], int(Y_train[i]))
-            correct += int(pred == Y_train[i])
+            _pred, (e1, e2) = net.learn(X_train[i], int(Y_train[i]))
             e1_epoch.append(e1); e2_epoch.append(e2)
             err_norm = np.sqrt(e1)
             sig_norm = np.linalg.norm(X_train[i]) / np.sqrt(N_INPUT)
             err_norm_epoch.append(err_norm / (sig_norm + 1e-6))
 
-        acc  = correct / N_TRAIN
+        # Measure accuracy with FREE inference (no label) — honest evaluation
+        correct = 0
+        for i in range(N_TRAIN):
+            _, pred_class, _ = net.infer(X_train[i], label=None)
+            correct += int(pred_class == Y_train[i])
+        acc = correct / N_TRAIN
+
         acc_per_epoch.append(acc)
         error_L1_log.append(np.mean(e1_epoch))
         error_L2_log.append(np.mean(e2_epoch))

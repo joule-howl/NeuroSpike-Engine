@@ -50,12 +50,12 @@ N_INPUT  = 784     # 28×28 pixels
 N_HIDDEN = 64
 T_STEPS  = 100     # Timesteps per sample
 TAU_M    = 0.9     # LIF membrane decay factor
-V_TH     = 1.0     # Spike threshold
+V_TH     = 15.0    # Spike threshold — calibrated for MNIST (784 inputs, W_mean ~0.15-0.3)
 V_RST    = 0.0     # Reset potential
 
 # STDP hyperparameters
 A_PLUS    =  0.005
-A_MINUS   = -0.003
+A_MINUS   = -0.005   # Balanced: equal LTP/LTD magnitude prevents drift
 TAU_PLUS  = 15
 TAU_MINUS = 15
 W_MAX     = 1.0
@@ -189,6 +189,7 @@ if __name__ == '__main__':
 
     N_EPOCHS  = 20
     N_SAMPLES = 200
+    N_VOTE    = 200    # Samples for WTA class assignment
     dw_history = []
 
     for epoch in range(N_EPOCHS):
@@ -200,17 +201,72 @@ if __name__ == '__main__':
             dw_total += stdp_update(sp_in, sp_out, W)
 
         W = np.clip(W + dw_total / N_SAMPLES, W_MIN, W_MAX)
+
+        # Weight decay: gentle L2 regularization prevents long-term saturation
+        # This is the primary defense against 100% firing rates slowing STDP
+        W *= 0.995
+
+        # Soft homeostatic normalization: only rescale neurons that saturate (>0.9 mean)
+        # Preserves relative weight differences while preventing hard saturation
+        col_means = W.mean(axis=0)
+        saturated = col_means > 0.9
+        if saturated.any():
+            W[:, saturated] *= 0.5
+
         dw_history.append(np.abs(dw_total).mean())
 
         if (epoch + 1) % 5 == 0:
             print(f"  Epoch {epoch+1:2d}/{N_EPOCHS} | ΔW = {dw_history[-1]:.6f} | W_mean = {W.mean():.4f}")
+
+    print("\nSTDP training complete")
+
+    # WTA readout: assign each hidden neuron to a class using more samples
+    print("\nBuilding WTA readout...")
+    vote_counts = np.zeros((10, N_HIDDEN), dtype=np.float32)
+    for s in range(N_VOTE):
+        rates, label = get_sample(s)
+        sp_in  = poisson_encode(rates, T_STEPS)
+        sp_out = lif_forward(sp_in, W)
+        vote_counts[label] += sp_out.sum(axis=0)
+    neuron_class = np.argmax(vote_counts, axis=0)  # shape (N_HIDDEN,)
+
+    # Test accuracy evaluation — use samples beyond the vote-counting range
+    N_TEST = 300
+    per_class_correct = np.zeros(10, dtype=int)
+    per_class_total   = np.zeros(10, dtype=int)
+    for s in range(N_VOTE, N_VOTE + N_TEST):
+        rates, label = get_sample(s)
+        sp_in  = poisson_encode(rates, T_STEPS)
+        sp_out = lif_forward(sp_in, W)
+        spike_counts = sp_out.sum(axis=0)
+        winner = int(np.argmax(spike_counts))
+        pred   = int(neuron_class[winner])
+        per_class_total[label] += 1
+        if pred == label:
+            per_class_correct[label] += 1
+    test_acc = per_class_correct.sum() / max(per_class_total.sum(), 1)
+    print(f"Test accuracy (WTA readout): {test_acc*100:.1f}%")
+
+    # Literature comparison — STDP on MNIST benchmarks
+    print("\n--- Literature comparison (STDP on MNIST) ---")
+    print("  This work (2-layer SNN, 64 hidden, 200 train samples, unsupervised STDP + WTA): "
+          f"{test_acc*100:.1f}%")
+    print("  Diehl & Cook (2015), STDP + homeostasis, 6400 hidden neurons, 60000 train samples: ~95%")
+    print("     [Diehl, P.U. & Cook, M. (2015). Unsupervised learning of digit recognition")
+    print("      using spike-timing-dependent plasticity. Front. Comput. Neurosci.]")
+    print("  Kheradpisheh et al. (2018), STDP + tempotron, 2-layer conv SNN: ~98.4%")
+    print("     [Kheradpisheh, S.R. et al. (2018). STDP-based spiking deep neural networks")
+    print("      for object recognition. arXiv:1611.01421v4]")
+    print("  Note: our low accuracy is expected — 64 neurons, 200 training samples,")
+    print("  no homeostasis, no convolution. This is a proof-of-concept pipeline,")
+    print("  not a competitive MNIST classifier.")
 
     # ---------------------------------------------------------------------------
     # Visualisation
     # ---------------------------------------------------------------------------
     W_init = np.random.uniform(0.0, 0.3, (N_INPUT, N_HIDDEN))
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     axes[0].plot(dw_history, color='#e15759', linewidth=2, marker='o', markersize=4)
     axes[0].set_xlabel('Epoch')
@@ -229,6 +285,21 @@ if __name__ == '__main__':
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
     axes[1].set_facecolor('#fafafa')
+
+    per_class_acc = np.where(per_class_total > 0,
+                              per_class_correct / np.maximum(per_class_total, 1), 0.0)
+    axes[2].bar(range(10), per_class_acc * 100, color='#4e79a7', alpha=0.8, edgecolor='white')
+    axes[2].axhline(test_acc * 100, color='red', linestyle='--', lw=1.5,
+                    label=f'Overall: {test_acc*100:.1f}%')
+    axes[2].set_xlabel('Digit class')
+    axes[2].set_ylabel('Accuracy (%)')
+    axes[2].set_title('Test Accuracy per Class\n(WTA readout, post-STDP)')
+    axes[2].set_xticks(range(10))
+    axes[2].set_ylim(0, 110)
+    axes[2].legend(fontsize=9)
+    axes[2].grid(True, alpha=0.3)
+    axes[2].set_facecolor('#fafafa')
+
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / 'stdp_weights.png', dpi=150, bbox_inches='tight')
     plt.close()
@@ -266,7 +337,6 @@ if __name__ == '__main__':
     plt.savefig(OUTPUT_DIR / 'raster_before_after.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-    print("\nSTDP training complete")
     print(f"  Architecture : {N_INPUT} → {N_HIDDEN} (LIF)")
     print(f"  Encoding     : Poisson Rate Coding ({T_STEPS} timesteps)")
     print(f"  W_mean       : {W_init.mean():.4f} → {W.mean():.4f}")

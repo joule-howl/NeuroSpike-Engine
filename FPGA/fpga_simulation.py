@@ -144,19 +144,19 @@ if __name__ == '__main__':
     print(f"FPGA (int16)   : {t_fpga_ms:.2f} ms | spike rate = {sp_fpga.mean()*100:.1f}%")
 
     # ---------------------------------------------------------------------------
-    # Power estimation (Xilinx 7-series model)
+    # Power estimation (Xilinx 7-series model) — ALL VALUES ESTIMATED VIA SIMULATION
     # ---------------------------------------------------------------------------
     FREQ_FPGA_MHZ  = 100.0
-    LUT_PER_NEURON = 150       # Estimated LUT count per 16-bit LIF neuron
+    LUT_PER_NEURON = 150       # Estimated LUT count per 16-bit LIF neuron (not measured)
     DSP_PER_NEURON = 2
     TOTAL_LUT      = LUT_PER_NEURON * N_HID
-    P_LUT_MW       = 0.05      # mW per LUT @ 100 MHz, 50% toggle rate
+    P_LUT_MW       = 0.05      # mW per LUT @ 100 MHz, 50% toggle rate (Xilinx power model estimate)
 
     P_fpga_dyn  = TOTAL_LUT * P_LUT_MW * (FREQ_FPGA_MHZ / 100)
-    P_fpga_stat = 50.0         # Artix-7 leakage (mW)
+    P_fpga_stat = 50.0         # Artix-7 leakage (mW) — estimated from datasheet, not measured
     P_fpga      = P_fpga_dyn + P_fpga_stat
 
-    P_cpu       = 3500.0       # Intel Core i5 under moderate load (mW)
+    P_cpu       = 3500.0       # Intel Core i5 under moderate load (mW) — estimated, not measured
 
     ops_total   = N_IN * N_HID * T_SIM
 
@@ -165,6 +165,11 @@ if __name__ == '__main__':
     print(f"  CPU  : {P_cpu:.0f} mW   |  {P_cpu/1e3*t_cpu_ms/1000:.4f} mJ")
     print(f"  Power saving  : {(1 - P_fpga/P_cpu)*100:.1f}%")
     print(f"  Energy eff.   : {ops_total / (P_fpga * t_fpga_ms * 1e-3):.0f} MOPS/mW")
+    print("\n  Note: all power and energy numbers are ESTIMATED via simulation,")
+    print("  not measured on physical hardware. FPGA power is derived from")
+    print("  Xilinx 7-series switching-power model (LUT-based estimate at")
+    print("  100 MHz, 50% toggle rate). CPU power is a typical Intel Core i5")
+    print("  value under moderate load. Actual hardware measurements will differ.")
 
     # ---------------------------------------------------------------------------
     # Plots
@@ -248,14 +253,5 @@ if __name__ == '__main__':
     plt.savefig(OUTPUT_DIR / 'fpga_simulation.png', dpi=150, bbox_inches='tight')
     plt.close()
     print("\nPlot saved → FPGA/fpga_simulation.png")
-    T  = spike_in.shape[0]
-    V  = np.zeros(W.shape[1], dtype=np.float32)
-    sp = np.zeros((T, W.shape[1]), dtype=np.float32)
-    for t in range(T):
-        V    = tau_m * V + spike_in[t] @ W
-        fire = V >= v_th
-        V[fire] = 0.0
-        sp[t, fire] = 1.0
-    return sp
 
 
