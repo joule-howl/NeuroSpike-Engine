@@ -43,20 +43,20 @@ np.random.seed(7)
 # Hyperparameters
 # ---------------------------------------------------------------------------
 N_IN        = 60
-N_HID       = 40
+N_HID       = 60    # Larger hidden layer: more neurons available per pattern
 T_STEPS     = 25
 TAU_M       = 0.88
-V_TH        = 1.0
+V_TH        = 4.0   # Higher threshold: prevents global saturation, forces selectivity
 
-A_PLUS      =  0.003
-A_MINUS     = -0.0035
-TAU_STDP    = 15
+A_PLUS      =  0.006   # Slightly stronger LTP for faster selectivity
+A_MINUS     = -0.004
+TAU_STDP    = 12       # Shorter time window → sharper selectivity
 
 # Sleep / consolidation
 REPLAY_BUFFER_SIZE = 500
-SLEEP_CYCLES       = 10
-SLEEP_EVERY        = 80
-PRUNE_THRESHOLD    = 0.02
+SLEEP_CYCLES       = 15   # More replay cycles for stronger consolidation
+SLEEP_EVERY        = 60   # Sleep more frequently
+PRUNE_THRESHOLD    = 0.015
 HOMEO_TARGET       = 0.25
 HOMEO_LR           = 0.003
 
@@ -72,12 +72,13 @@ N_TEST       = 60
 # Spike pattern generator (3 distinct patterns)
 # ---------------------------------------------------------------------------
 def make_pattern(pid: int, n: int = N_IN, T: int = T_STEPS,
-                 rate: float = 0.25) -> np.ndarray:
+                 rate: float = 0.5) -> np.ndarray:
     """
     3 non-overlapping patterns — each activates a distinct 1/3 of neurons.
-    High contrast to ensure STDP can differentiate them.
+    High signal-to-noise ratio (active 0.5 vs background 0.005) ensures
+    STDP reliably differentiates patterns; critical for consolidation demo.
     """
-    sp = (np.random.rand(T, n) < 0.02).astype(np.float32)  # sparse background
+    sp = (np.random.rand(T, n) < 0.005).astype(np.float32)  # very sparse background
     seg   = n // N_PATTERNS
     start = pid * seg
     end   = start + seg
@@ -147,7 +148,7 @@ def sleep_consolidation(W: np.ndarray, replay_buffer: deque,
         sp_in = replay_buffer[np.random.randint(len(replay_buffer))]
         _, dw, _ = stdp_step(W, sp_in)
         # Apply with reduced learning rate (consolidation is gentle)
-        W = np.clip(W + dw * 0.3, W_MIN, W_MAX)
+        W = np.clip(W + dw * 0.2, W_MIN, W_MAX)
 
     # Pruning: remove weak synapses
     if prune:
@@ -168,13 +169,36 @@ def sleep_consolidation(W: np.ndarray, replay_buffer: deque,
 # ---------------------------------------------------------------------------
 # Evaluation: accuracy on all patterns seen so far
 # ---------------------------------------------------------------------------
+def build_neuron_class(W: np.ndarray, patterns_seen: list,
+                       n_vote: int = 30) -> np.ndarray:
+    """
+    Assign each hidden neuron to the pattern it responds to most strongly
+    using a WTA vote over held-out samples.  Returns neuron_class (N_HID,).
+    """
+    vote = np.zeros((N_PATTERNS, N_HID), dtype=np.float32)
+    for pid in patterns_seen:
+        for _ in range(n_vote):
+            sp_in = make_pattern(pid)
+            V     = np.zeros(N_HID, dtype=np.float32)
+            sp_out = np.zeros((T_STEPS, N_HID), dtype=np.float32)
+            for t in range(T_STEPS):
+                V = TAU_M * V + sp_in[t] @ W
+                fired = V >= V_TH; V[fired] = 0.0
+                sp_out[t, fired] = 1.0
+            vote[pid] += sp_out.sum(axis=0)
+    return np.argmax(vote, axis=0)   # shape (N_HID,)
+
+
 def evaluate(W: np.ndarray, patterns_seen: list, n_test: int = N_TEST):
     """
-    Evaluate using a simple winner-takes-all readout:
-    run each pattern once, assign class by which input segment
-    drove the highest total spike count in its dedicated hidden neurons.
+    Evaluate using a learned WTA readout:
+      1. Build neuron→class assignment via max-response voting.
+      2. For each test sample, fire the network, find the winner neuron,
+         and predict its assigned class.
+    This is more robust than a fixed-segment readout because it does not
+    assume any spatial organisation of hidden neurons.
     """
-    seg_h = N_HID // N_PATTERNS   # hidden neurons per pattern
+    neuron_class = build_neuron_class(W, patterns_seen)
 
     accs = []
     for pid in patterns_seen:
@@ -187,10 +211,9 @@ def evaluate(W: np.ndarray, patterns_seen: list, n_test: int = N_TEST):
                 V = TAU_M * V + sp_in[t] @ W
                 fired = V >= V_TH; V[fired] = 0.0
                 sp_out[t, fired] = 1.0
-            # Readout: which hidden segment fired most?
-            seg_acts = [sp_out[:, p*seg_h:(p+1)*seg_h].sum()
-                        for p in range(N_PATTERNS)]
-            pred = int(np.argmax(seg_acts))
+            spike_counts = sp_out.sum(axis=0)
+            winner = int(np.argmax(spike_counts))
+            pred   = int(neuron_class[winner])
             correct += int(pred == pid)
         accs.append(correct / n_test)
     return accs
@@ -293,8 +316,8 @@ if __name__ == '__main__':
     for pid in range(N_PATTERNS):
         for _ in range(N_TRIALS_PER):
             sp  = make_pattern(pid)
-            _, dw, _ = stdp_step(W_no_sleep, sp); W_no_sleep = np.clip(W_no_sleep + dw*0.5, 0, 1)
-            _, dw, _ = stdp_step(W_with_sleep, sp); W_with_sleep = np.clip(W_with_sleep + dw*0.5, 0, 1)
+            _, dw, _ = stdp_step(W_no_sleep, sp); W_no_sleep = np.clip(W_no_sleep + dw*0.2, 0, 1)
+            _, dw, _ = stdp_step(W_with_sleep, sp); W_with_sleep = np.clip(W_with_sleep + dw*0.2, 0, 1)
             buf2.append(sp)
         if pid < N_PATTERNS - 1:
             W_with_sleep = sleep_consolidation(W_with_sleep, buf2)

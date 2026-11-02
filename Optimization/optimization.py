@@ -64,8 +64,9 @@ class StateSpaceModel:
     def __init__(self, d_in, d_state, d_out, seed=5):
         np.random.seed(seed)
         s = 1.0 / np.sqrt(d_state)
-        # Stable A matrix (spectral radius < 1)
-        self.A = np.eye(d_state) * 0.9 - s * np.abs(np.random.randn(d_state, d_state))
+        # Stable A matrix (spectral radius < 1) — float32 to match B, C, h
+        self.A = (np.eye(d_state, dtype=np.float32) * 0.9
+                  - s * np.abs(np.random.randn(d_state, d_state)).astype(np.float32))
         self.B = s * np.random.randn(d_state, d_in).astype(np.float32)
         self.C = s * np.random.randn(d_out, d_state).astype(np.float32)
         self.D = np.zeros((d_out, d_in), dtype=np.float32)
@@ -245,65 +246,5 @@ if __name__ == '__main__':
           f"({nnz_counts[thresholds.index(BEST_THR)]:,} connections)")
     print(f"  SSM    : {ssm.state_ram()} bytes (constant hidden state for any T)")
     print("Plots saved → Optimization/")
-    """
-    Linear Time-Invariant SSM:
-        h[t] = A · h[t-1] + B · x[t]
-        y[t] = C · h[t]   + D · x[t]
-
-    The hidden state h has fixed size d_state, independent of sequence
-    length T — unlike Transformers that require an O(T) KV-cache.
-    """
-
-    def __init__(self, d_in, d_state, d_out, seed=5):
-        np.random.seed(seed)
-        s = 1.0 / np.sqrt(d_state)
-        # Stable A matrix (spectral radius < 1)
-        self.A = np.eye(d_state) * 0.9 - s * np.abs(np.random.randn(d_state, d_state))
-        self.B = s * np.random.randn(d_state, d_in).astype(np.float32)
-        self.C = s * np.random.randn(d_out, d_state).astype(np.float32)
-        self.D = np.zeros((d_out, d_in), dtype=np.float32)
-        self.d_state = d_state
-
-    def step(self, x, h):
-        h = self.A @ h + self.B @ x
-        y = self.C @ h  + self.D @ x
-        return y, h
-
-    def forward(self, X):
-        """X: [T, d_in] → outputs: [T, d_out]"""
-        h   = np.zeros(self.d_state, dtype=np.float32)
-        out = []
-        for x in X:
-            y, h = self.step(x, h)
-            out.append(y)
-        return np.array(out)
-
-    def state_ram(self):
-        """State RAM in bytes – constant for any sequence length T."""
-        return self.d_state * 4
-
-
-D_IN, D_STATE, D_OUT = 32, 16, 32
-ssm = StateSpaceModel(D_IN, D_STATE, D_OUT)
-
-seq_lengths = [50, 200, 500, 1000, 2000, 5000]
-ram_ssm_list, ram_trans_list = [], []
-
-print(f"\n  SSM: d_in={D_IN}  d_state={D_STATE}  d_out={D_OUT}")
-print(f"  {'T':<8} {'Transformer RAM':>18} {'SSM RAM':>12} {'Ratio':>8}")
-print("  " + "-" * 50)
-for T_len in seq_lengths:
-    rt = T_len * D_IN * 2 * 4          # KV-cache (bytes)
-    rs = ssm.state_ram()
-    ram_trans_list.append(rt / 1024)
-    ram_ssm_list.append(rs / 1024)
-    print(f"  {T_len:<8} {rt/1024:>15.1f} KB  {rs/1024:>8.3f} KB  {rt//rs:>6}×")
-
-    X_test = np.random.randn(1000, D_IN).astype(np.float32)
-    t0 = time.perf_counter()
-    ssm_out = ssm.forward(X_test)
-    t_ssm   = (time.perf_counter() - t0) * 1000
-    print(f"\n  SSM inference T=1000: {t_ssm:.2f} ms | "
-          f"state RAM = {ssm.state_ram()} bytes (constant)")
 
 
